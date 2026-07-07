@@ -80,11 +80,39 @@ rely on a fixed list here.
    issues/docs) where the current gaps are tracked, so the target form is clear
    once the compiler catches up.
 
-## Layout awareness (write logical; the compiler tiles physical)
+## Layout awareness (emit the physical device layout yourself)
 
-Write descriptors in **logical** shape — the tensor's math dimensions — see the
-worked [`../_shared/examples/matmul-logical.md`](../_shared/examples/matmul-logical.md).
-You do **not** hand-write the physical device layout; the compiler derives it.
+> **Proposal 1.** In this variant the kernel carries the **physical stick-tiled
+> layout directly** in the descriptor's `shape`/`strides`/`block_shape` — stock
+> `tl.make_tensor_descriptor`, no marker op, no compiler layout pass. You compute
+> the stick factoring and the reshape glue; the compiler sees an ordinary strided
+> tensor. See the worked
+> [`../_shared/examples/matmul-physical.md`](../_shared/examples/matmul-physical.md).
+
+For every stick-tiled tensor:
+
+1. **Elements per stick is dtype-dependent.** A DataStick is **128 bytes**, so
+   `S = 128 // dtype_bytes` — **64** for fp16/bf16, **32** for fp32, **128** for
+   fp8. Do **not** hard-code 64.
+
+2. **Factor the stick dimension.** The innermost matrix dim is stick-tiled
+   (K for A, N for B, N for C in a matmul). Logical `[..., D, ...]` becomes a
+   physical shape with the stick dim split into `(D // S, S)`.
+
+3. **Permute so the stick pair is adjacent and innermost.** `tl.dot` needs a 2D
+   tile, so the `(D // S, S)` pair must sit last (leading matrix/batch dims ahead)
+   and collapse with one `reshape`. For `A[M, K]` stick-on-K the operand order is
+   **`[M, K // S, S]`** (→ reshape `[M, K]`), **not** `[K // S, M, S]`.
+
+4. **Row-major strides over the physical shape.** For `[M, K // S, S]` that is
+   `[K, S, 1]`.
+
+5. **Reshape at the boundaries.** After each `.load()` collapse the stick pair to
+   the logical 2D tile before `tl.dot`; before each `.store()` reshape the 2D
+   accumulator back to the physical shape.
+
+The [`../_shared/descriptor-rules.md`](../_shared/descriptor-rules.md) "Physical
+stick layouts" section gives the factoring/stride/reshape mechanics in full.
 
 ## Output file structure
 

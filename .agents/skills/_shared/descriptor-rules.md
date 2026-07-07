@@ -147,3 +147,55 @@ a per-row / per-program index into an otherwise structured tensor — **is**
 portable via `desc.gather` / `desc.scatter`. Reach for those before declaring
 defeat. (The gathered tile still owes §4: gather a ≥ 16-byte slice, not a single
 element.)
+
+## 6. Physical stick layouts (Proposal 1 — emit the device layout yourself)
+
+> **Spyre-family only.** This section applies when the kernel carries the
+> physical stick-tiled layout directly in the descriptor (the "physical" convert
+> variant). The logical variant skips it — the compiler derives the layout.
+
+A Spyre tensor lives in memory as fixed-size **sticks**. A DataStick is
+**128 bytes**, so the number of elements per stick is dtype-dependent:
+
+```
+S = 128 // dtype_bytes      # 64 for fp16/bf16, 32 for fp32, 128 for fp8
+```
+
+Do **not** hard-code 64 — it is only the 2-byte case.
+
+**Factor the stick dimension.** The stick-tiled (innermost matrix) dimension `D`
+splits into `(D // S, S)` — a stick-index dim and a within-stick lane dim. So a
+logical rank-2 tile gains one dim and becomes rank-3.
+
+**Permute the pair innermost.** `tl.dot` consumes a 2D tile, so the `(D // S, S)`
+pair must be **adjacent and innermost**, with leading matrix/batch dims kept
+ahead. A single `reshape` then collapses the pair back into the matrix dim as a
+free view. For `A[M, K]` stick-on-K the operand order is:
+
+```python
+# physical shape        row-major strides
+[M, K // S, S]          [K, S, 1]           # reshape -> [M, K]
+```
+
+Note the axis order is `[M, K//S, S]`, **not** `[K//S, M, S]` — the stick pair
+(indices 1,2) must be adjacent so the reshape is a view, not a shuffle.
+
+**Reshape at the boundaries.**
+
+```python
+tile = a_desc.load([...])          # physical rank-3: [BLOCK_M, BLOCK_K//S, S]
+tile = tile.reshape(BLOCK_M, BLOCK_K)   # logical 2D for tl.dot
+...
+acc  = acc.reshape(BLOCK_M, BLOCK_N // S, S)   # back to physical
+c_desc.store([...], acc)
+```
+
+See the full worked kernel in
+[`examples/matmul-physical.md`](examples/matmul-physical.md).
+
+**Common failure modes** (also the review checklist):
+- Hard-coded `64` where the dtype is not 2 bytes → wrong stick count.
+- `[D//S, M, S]` axis order → the stick pair is not adjacent, so the reshape is a
+  transpose (silent wrong result) or a rank error.
+- Strides not row-major over the *physical* shape.
+- A missing reshape → rank mismatch into `tl.dot` / `.store()`.

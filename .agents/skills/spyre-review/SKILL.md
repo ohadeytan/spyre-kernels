@@ -59,6 +59,20 @@ original's `other=`). Per `descriptor-rules.md` §4 a scalar descriptor must be
 resolved (last dim ≥ 16 bytes) or the kernel declared non-portable — a surviving
 scalar descriptor or stale gap annotation is a FAIL.
 
+### Step 2b — Physical stick layout (Proposal 1)
+
+For the physical convert variant (see `descriptor-rules.md` §6), verify the
+device layout the kernel emits:
+- **Stick element count** `S = 128 // dtype_bytes` (64 fp16/bf16, 32 fp32, 128
+  fp8) — a hard-coded `64` on a non-2-byte dtype is a **FAIL**.
+- **Factoring**: each stick-tiled descriptor's `shape` splits the stick dim into
+  `(D // S, S)`, with the pair **adjacent and innermost** (`[M, K//S, S]`, not
+  `[K//S, M, S]`). Wrong axis order is a **FAIL** (silent transpose / rank error).
+- **Strides** are row-major over the physical shape.
+- **Reshape glue**: every physical `.load()` is followed by a reshape to the
+  logical 2D tile before `tl.dot`; the accumulator is reshaped back before
+  `.store()`. A missing reshape is a **FAIL** (rank mismatch).
+
 ### Step 3 — Spyre-compiler descriptor patterns
 
 The set of compiler descriptor gaps changes as the lowering evolves, so this
