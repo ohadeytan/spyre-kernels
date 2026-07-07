@@ -59,6 +59,24 @@ original's `other=`). Per `descriptor-rules.md` §4 a scalar descriptor must be
 resolved (last dim ≥ 16 bytes) or the kernel declared non-portable — a surviving
 scalar descriptor or stale gap annotation is a FAIL.
 
+### Step 2b — Physical layout markers (Proposal 2)
+
+For stick-tiled tensors, verify the `tl.spyre_tensor_layout` markers (see
+[`../_shared/spyre/tensor-layout-marker.md`](../_shared/spyre/tensor-layout-marker.md)):
+- **Present** on each stick-tiled descriptor; **inline literal** or a `constexpr`
+  arg (a list bound to a plain local is a compile error — FAIL).
+- **Well-formed**: one entry per physical dim; `stick-on-X` form
+  `[(X,"floordiv",S), other, (X,"mod",S)]`; `src` indices in range for the
+  logical rank.
+- **Stick divisor** `S = 128 // dtype_bytes` (64 fp16/bf16, 32 fp32, 128 fp8) —
+  a hard-coded `64` on a non-2-byte dtype is a FAIL.
+- **Axis matches intent**: the marked axis is the one actually stick-tiled; A
+  stick-on-K vs stick-on-M changes the synthesized case.
+- **Output descriptor** carries a marker when the store must scatter into sticks.
+- Because PR #19's `RewriteDescriptorLayout` closes the layout gap, a *missing*
+  marker where one is needed is a **FAIL**, not a `# [gap]` (reconcile with
+  Step 3 / `gap-handling.md`).
+
 ### Step 3 — Spyre-compiler descriptor patterns
 
 The set of compiler descriptor gaps changes as the lowering evolves, so this

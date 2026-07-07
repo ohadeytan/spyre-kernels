@@ -80,11 +80,46 @@ rely on a fixed list here.
    issues/docs) where the current gaps are tracked, so the target form is clear
    once the compiler catches up.
 
-## Layout awareness (write logical; the compiler tiles physical)
+## Layout awareness (write logical; annotate the physical layout with a marker)
 
 Write descriptors in **logical** shape — the tensor's math dimensions — see the
 worked [`../_shared/examples/matmul-logical.md`](../_shared/examples/matmul-logical.md).
-You do **not** hand-write the physical device layout; the compiler derives it.
+You do **not** hand-write the physical device layout in the shape/strides; the
+compiler tiles it.
+
+> **Proposal 2.** When a tensor is stick-tiled, make the physical layout
+> **explicit** with a `tl.spyre_tensor_layout` marker on its descriptor. The
+> descriptor stays logical; the marker declares the stick factoring; the compiler's
+> `RewriteDescriptorLayout` pass synthesizes the physical loops. `tl.dot` is
+> untouched and there is **no** reshape glue (contrast the physical variant).
+
+For each stick-tiled descriptor, immediately after constructing it:
+
+```python
+a_desc = tl.make_tensor_descriptor(a_ptr, shape=[M, K], strides=[K, 1],
+                                    block_shape=[BLOCK_M, BLOCK_K])
+tl.spyre_tensor_layout(a_desc, [(0, "floordiv", 64), 1, (0, "mod", 64)])  # stick-on-M
+```
+
+- **One entry per physical dim**, in the order `[stick-index, other…, lane]`.
+  Convention: `stick-on-X` → `[(X, "floordiv", S), other, (X, "mod", S)]`. Bare
+  int = identity on that logical dim; `(src,"floordiv",S)` = stick index;
+  `(src,"mod",S)` = within-stick lane.
+- **`src` is the logical dim index** being stick-tiled (K for `A[M,K]` is dim 1;
+  K for `B[K,N]` is dim 0 — same-looking markers name different axes).
+- **`S = 128 // dtype_bytes`** (64 fp16/bf16, 32 fp32, 128 fp8) — not hard-coded.
+- **Inline only.** The list must be a literal at the call site; binding it to a
+  local makes the jit try to tensor-convert the keyword strings (compile error).
+- **Mark the output descriptor** too when the store must scatter into sticks.
+
+Which matmul "case" results (parallel M/N split vs K-reduction) is a *consequence*
+of which axis you mark — the compiler decides, not you. See
+[`../_shared/spyre/tensor-layout-marker.md`](../_shared/spyre/tensor-layout-marker.md)
+for the full coordinate-map reference.
+
+> **Dependency:** `tl.spyre_tensor_layout` requires the PR #19 Triton build
+> (`torch-spyre/triton` #19). KTIR generation is pinned to that fork/SHA — see
+> [`../_shared/spyre/tensor-layout-marker.md`](../_shared/spyre/tensor-layout-marker.md).
 
 ## Output file structure
 

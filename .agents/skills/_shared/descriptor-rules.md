@@ -147,3 +147,19 @@ a per-row / per-program index into an otherwise structured tensor — **is**
 portable via `desc.gather` / `desc.scatter`. Reach for those before declaring
 defeat. (The gathered tile still owes §4: gather a ≥ 16-byte slice, not a single
 element.)
+
+## 6. Physical stick layout — annotate with `tl.spyre_tensor_layout` (Proposal 2)
+
+> **Spyre-family only, PR-#19-gated.** For stick-tiled tensors, keep the
+> descriptor **logical** and declare the physical layout with a
+> `tl.spyre_tensor_layout` marker; the compiler synthesizes the physical loops.
+> `tl.dot` is unchanged and there is no reshape glue.
+
+```python
+tl.spyre_tensor_layout(a_desc, [(0, "floordiv", 64), 1, (0, "mod", 64)])  # A[M,K] stick-on-M
+```
+
+The stick divisor is `S = 128 // dtype_bytes` (64 fp16/bf16, 32 fp32, 128 fp8),
+and the list must be **inline** (or a `constexpr` arg). Full coordinate-map
+reference, cases, output-sink behavior, and the dependency pin:
+[`spyre/tensor-layout-marker.md`](spyre/tensor-layout-marker.md).

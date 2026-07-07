@@ -23,9 +23,10 @@ concurrency:
 
 env:
   # spyre-enabled Triton build used to lower kernels to KTIR. Pinned to the
-  # sha the committed *.ktir were generated with (README pin); @main currently
-  # breaks the make_tensor_descriptor lowering path (_unflatten_ir on None).
-  SPYRE_TRITON: "triton @ git+https://github.com/torch-spyre/triton@5b467467c883c53ec7a8a89f9e89cfd55241034b"
+  # sha the committed *.ktir were generated with (README pin).
+  # Proposal 2: repointed to torch-spyre/triton PR #19 (fabianlim fork), which
+  # adds the tl.spyre_tensor_layout builtin + RewriteDescriptorLayout pass.
+  SPYRE_TRITON: "triton @ git+https://github.com/fabianlim/triton@7814b6728427e9bf1b5506d5fd891c73c5de0992"
 
 jobs:
 # GPU tests - uncomment when we have a GPU worker available
