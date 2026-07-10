@@ -84,4 +84,4 @@ jobs:
       # that (pytest still imports deselected modules). Add CPU-safe ktir test
       # files here as they gain the ktir_cpu marker.
       - name: Run ktir-cpu validation tests
-        run: uv run pytest tests/ktir/test_rms_norm.py -m ktir_cpu -v
+        run: uv run pytest tests/ktir/test_rms_norm.py tests/ktir/test_prefill_attention.py -m ktir_cpu -v
