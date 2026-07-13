@@ -82,9 +82,9 @@ def numpy_reference(q, k, v, mask):
     return out.astype(np.float16)
 
 
-def _run(q, k, v, mask):
+def _run(q, k, v, mask, *, mlir_path=MLIR_PATH):
     interp = KTIRInterpreter()
-    interp.load(MLIR_PATH.read_text())
+    interp.load(mlir_path.read_text())
 
     out = np.zeros((SEQ, H, D), dtype=np.float16)
     q_bs, q_h = H * D, D          # contiguous [SEQ, H, D] strides (elements)
@@ -102,6 +102,13 @@ def _run(q, k, v, mask):
         arg17=np.int32(NUM_M_BLOCKS),
     )
     return outputs["arg4"]
+
+
+def _dist_mlir_path(cores: int) -> Path:
+    return MLIR_PATH.parent / f"spyre_dist_c{cores}.ktir"
+
+
+DIST_CORE_COUNTS = (1, 4, 16, 32)
 
 
 @pytest.mark.ktir_cpu
@@ -150,3 +157,73 @@ def test_prefill_attention_ktir_uniform_v():
     expected = np.broadcast_to(v_row.astype(np.float32), (SEQ, H, D))
     np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
     print("PASS: uniform V")
+
+
+# ─── Distribution invariance ────────────────────────────────────────────────
+
+
+@pytest.mark.ktir_cpu
+class TestPrefillAttentionDistribution:
+    """The distribution loop must be partition-independent.
+
+    Each core walks the whole key range; the loop only slices the
+    (batch, head, m_block) work space across ``num_cores`` (frozen into each
+    ``spyre_dist_c<N>.ktir`` at lowering). So the result must be identical for
+    every core count. The default shape has 8 work items
+    (batch 1 × 4 heads × 2 m_blocks), so the partitions genuinely differ: grid 1
+    runs all 8 on one core, grid 4 puts 2 per core, grids 16/32 leave most cores
+    idle (more cores than work). If a ``.ktir`` variant is missing (spyre
+    toolchain not run), that parametrization skips.
+    """
+
+    @staticmethod
+    def _require(cores: int) -> Path:
+        path = _dist_mlir_path(cores)
+        if not path.is_file():
+            pytest.skip(
+                f"{path.name} not generated — regenerate with:\n"
+                "  GIT_PAT=$(gh auth token) TRITON_DEFAULT_BACKEND=spyre uv run "
+                '--with "$SPYRE_TRITON" python scripts/gen_ktir.py prefill_attention'
+            )
+        return path
+
+    @pytest.mark.parametrize("cores", DIST_CORE_COUNTS)
+    def test_matches_reference(self, cores):
+        """Each core count matches the NumPy causal-attention reference."""
+        mlir_path = self._require(cores)
+        rng = np.random.default_rng(42)
+        q = (rng.standard_normal((SEQ, H, D)) * 0.1).astype(np.float16)
+        k = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+        v = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+        mask = causal_mask()
+
+        result = _run(q, k, v, mask, mlir_path=mlir_path)
+        expected = numpy_reference(q, k, v, mask)
+
+        np.testing.assert_allclose(
+            result.astype(np.float32), expected.astype(np.float32),
+            rtol=1e-2, atol=1e-2,
+        )
+        max_err = np.max(np.abs(result.astype(np.float32) - expected.astype(np.float32)))
+        print(f"PASS cores={cores}: max abs error = {max_err:.6f}")
+
+    def test_invariant_across_core_counts(self):
+        """All core counts must agree bitwise: a work item's online-softmax is
+        independent of which core runs it, so re-partitioning cannot shift the
+        result (per-item op order is identical across grids; only the
+        item-to-core assignment changes)."""
+        rng = np.random.default_rng(42)
+        q = (rng.standard_normal((SEQ, H, D)) * 0.1).astype(np.float16)
+        k = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+        v = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+        mask = causal_mask()
+
+        baseline_cores = DIST_CORE_COUNTS[0]
+        baseline = _run(q, k, v, mask, mlir_path=self._require(baseline_cores))
+        for cores in DIST_CORE_COUNTS[1:]:
+            result = _run(q, k, v, mask, mlir_path=self._require(cores))
+            np.testing.assert_array_equal(
+                result, baseline,
+                err_msg=f"cores={cores} differs from cores={baseline_cores}",
+            )
+        print(f"PASS: bitwise-identical across cores {DIST_CORE_COUNTS}")
