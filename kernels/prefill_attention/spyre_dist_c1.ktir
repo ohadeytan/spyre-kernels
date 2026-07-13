@@ -1,0 +1,117 @@
+// Generated from kernels/prefill_attention/spyre_dist_c1.py by scripts/gen_ktir.py
+// Source: kernels/prefill_attention/lower.py -> VARIANTS['spyre_dist_c1'].
+// DO NOT EDIT BY HAND — regenerate with:
+//     .venv/bin/python scripts/gen_ktir.py prefill_attention:spyre_dist_c1
+
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map1 = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#set2 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 255 >= 0)>
+#set3 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set4 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#set5 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+module {
+  func.func @_prefill_attention_kernel_spyre(%arg0: index, %arg1: index, %arg2: index, %arg3: index, %arg4: f32, %arg5: index, %arg6: i32, %arg7: i32, %arg8: i32, %arg9: i32, %arg10: i32) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %cst = arith.constant 0.000000e+00 : f32
+    %cst_0 = arith.constant 0xFF800000 : f32
+    %cst_1 = arith.constant dense<0xFF800000> : tensor<128xf32>
+    %cst_2 = arith.constant dense<0.000000e+00> : tensor<128x64xf32>
+    %cst_3 = arith.constant dense<0.000000e+00> : tensor<128xf32>
+    %c1_i32 = arith.constant 1 : i32
+    %cst_4 = arith.constant dense<0.000000e+00> : tensor<128x128xf32>
+    %c0_i32 = arith.constant 0 : i32
+    %c128_i32 = arith.constant 128 : i32
+    %c256_i32 = arith.constant 256 : i32
+    %c2_i32 = arith.constant 2 : i32
+
+    %pid = ktdp.get_compute_tile_id : index
+    %pid_5 = arith.index_cast %pid : index to i32
+    %work_start = arith.muli %pid_5, %c2_i32 : i32
+    %work_end = arith.addi %work_start, %c2_i32 : i32
+    %work_end_6 = arith.minsi %work_end, %c2_i32 : i32
+    %q_desc = arith.index_cast %arg6 : i32 to index
+
+    %q_desc_7 = ktdp.construct_memory_view %arg0, sizes: [1, 256, 64], strides: [64, %q_desc, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x256x64xf16>
+    %k_desc = arith.index_cast %arg7 : i32 to index
+
+    %k_desc_8 = ktdp.construct_memory_view %arg1, sizes: [256, 64], strides: [%k_desc, 1] {coordinate_set = #set1, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<256x64xf16>
+    %v_desc = arith.index_cast %arg8 : i32 to index
+
+    %v_desc_9 = ktdp.construct_memory_view %arg2, sizes: [1, 256, 64], strides: [64, %v_desc, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x256x64xf16>
+    %o_desc = arith.index_cast %arg9 : i32 to index
+
+    %o_desc_10 = ktdp.construct_memory_view %arg5, sizes: [1, 256, 64], strides: [64, %o_desc, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x256x64xf16>
+    %m_desc = arith.index_cast %arg10 : i32 to index
+
+    %m_desc_11 = ktdp.construct_memory_view %arg3, sizes: [256, 256], strides: [%m_desc, 1] {coordinate_set = #set2, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<256x256xf32>
+
+    scf.for %arg11 = %work_start to %work_end_6 step %c1_i32  : i32 {
+      %q_row0 = arith.muli %arg11, %c128_i32 : i32
+      %q = arith.index_cast %q_row0 : i32 to index
+
+      %q_12 = ktdp.construct_access_tile %q_desc_7[%c0, %q, %c0] {access_tile_order = #map, access_tile_set = #set3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x128x64xindex>
+      %q_13 = ktdp.load %q_12 : <1x128x64xindex> -> tensor<1x128x64xf16>
+
+      %acc:3 = scf.for %arg12 = %c0_i32 to %c256_i32 step %c128_i32 iter_args(%arg13 = %cst_1, %arg14 = %cst_3, %arg15 = %cst_2) -> (tensor<128xf32>, tensor<128xf32>, tensor<128x64xf32>)  : i32 {
+        %k = arith.index_cast %arg12 : i32 to index
+
+        %k_18 = ktdp.construct_access_tile %k_desc_8[%k, %c0] {access_tile_order = #map1, access_tile_set = #set4} : memref<256x64xf16> -> !ktdp.access_tile<128x64xindex>
+        %k_19 = ktdp.load %k_18 : <128x64xindex> -> tensor<128x64xf16>
+        %qk = tensor.empty() : tensor<64x128xf16>
+        %qk_20 = linalg.transpose ins(%k_19 : tensor<128x64xf16>) outs(%qk : tensor<64x128xf16>) permutation = [1, 0]
+        %qk_21 = tensor.extract_slice %q_13[0, 0, 0] [1, 128, 64] [1, 1, 1] : tensor<1x128x64xf16> to tensor<128x64xf16>
+        %qk_22 = linalg.matmul ins(%qk_21, %qk_20 : tensor<128x64xf16>, tensor<64x128xf16>) outs(%cst_4 : tensor<128x128xf32>) -> tensor<128x128xf32>
+        %qk_23 = tensor.empty() : tensor<128x128xf32>
+        %qk_24 = linalg.fill ins(%arg4 : f32) outs(%qk_23 : tensor<128x128xf32>) -> tensor<128x128xf32>
+        %qk_25 = arith.mulf %qk_22, %qk_24 : tensor<128x128xf32>
+
+        %qk_26 = ktdp.construct_access_tile %m_desc_11[%q, %k] {access_tile_order = #map1, access_tile_set = #set5} : memref<256x256xf32> -> !ktdp.access_tile<128x128xindex>
+        %qk_27 = ktdp.load %qk_26 : <128x128xindex> -> tensor<128x128xf32>
+        %qk_28 = arith.addf %qk_25, %qk_27 : tensor<128x128xf32>
+        %m_ij = tensor.empty() : tensor<128xf32>
+        %m_ij_29 = linalg.fill ins(%cst_0 : f32) outs(%m_ij : tensor<128xf32>) -> tensor<128xf32>
+        %m_ij_30 = linalg.reduce ins(%qk_28 : tensor<128x128xf32>) outs(%m_ij_29 : tensor<128xf32>) dimensions = [1] 
+          (%qk_44: f32, %m_ij_45: f32) {
+            %m_ij_46 = arith.maxnumf %qk_44, %m_ij_45 : f32
+            linalg.yield %m_ij_46 : f32
+          }
+        %m_ij_31 = arith.maxnumf %arg13, %m_ij_30 : tensor<128xf32>
+        %qk_32 = linalg.broadcast ins(%m_ij_31 : tensor<128xf32>) outs(%qk_23 : tensor<128x128xf32>) dimensions = [1]
+        %qk_33 = arith.subf %qk_28, %qk_32 : tensor<128x128xf32>
+        %p = math.exp %qk_33 : tensor<128x128xf32>
+        %l_ij = linalg.fill ins(%cst : f32) outs(%m_ij : tensor<128xf32>) -> tensor<128xf32>
+        %l_ij_34 = linalg.reduce ins(%p : tensor<128x128xf32>) outs(%l_ij : tensor<128xf32>) dimensions = [1] 
+          (%p_44: f32, %l_ij_45: f32) {
+            %l_ij_46 = arith.addf %p_44, %l_ij_45 : f32
+            linalg.yield %l_ij_46 : f32
+          }
+        %alpha = arith.subf %arg13, %m_ij_31 : tensor<128xf32>
+        %alpha_35 = math.exp %alpha : tensor<128xf32>
+        %l_i = arith.mulf %arg14, %alpha_35 : tensor<128xf32>
+        %l_i_36 = arith.addf %l_i, %l_ij_34 : tensor<128xf32>
+        %acc_37 = tensor.empty() : tensor<128x64xf32>
+        %acc_38 = linalg.broadcast ins(%alpha_35 : tensor<128xf32>) outs(%acc_37 : tensor<128x64xf32>) dimensions = [1]
+        %acc_39 = arith.mulf %arg15, %acc_38 : tensor<128x64xf32>
+
+        %v = ktdp.construct_access_tile %v_desc_9[%c0, %k, %c0] {access_tile_order = #map, access_tile_set = #set3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x128x64xindex>
+        %v_40 = ktdp.load %v : <1x128x64xindex> -> tensor<1x128x64xf16>
+        %p_41 = arith.truncf %p : tensor<128x128xf32> to tensor<128x128xf16>
+        %acc_42 = tensor.extract_slice %v_40[0, 0, 0] [1, 128, 64] [1, 1, 1] : tensor<1x128x64xf16> to tensor<128x64xf16>
+        %acc_43 = linalg.matmul ins(%p_41, %acc_42 : tensor<128x128xf16>, tensor<128x64xf16>) outs(%acc_39 : tensor<128x64xf32>) -> tensor<128x64xf32>
+        scf.yield %m_ij_31, %l_i_36, %acc_43 : tensor<128xf32>, tensor<128xf32>, tensor<128x64xf32>
+      }
+      %acc_14 = tensor.empty() : tensor<128x64xf32>
+      %acc_15 = linalg.broadcast ins(%acc#1 : tensor<128xf32>) outs(%acc_14 : tensor<128x64xf32>) dimensions = [1]
+      %acc_16 = arith.divf %acc#2, %acc_15 : tensor<128x64xf32>
+      %acc_17 = arith.truncf %acc_16 : tensor<128x64xf32> to tensor<128x64xf16>
+
+      %0 = ktdp.construct_access_tile %o_desc_10[%c0, %q, %c0] {access_tile_order = #map, access_tile_set = #set3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x128x64xindex>
+      %1 = tensor.empty() : tensor<1x128x64xf16>
+      %inserted_slice = tensor.insert_slice %acc_17 into %1[0, 0, 0] [1, 128, 64] [1, 1, 1] : tensor<128x64xf16> into tensor<1x128x64xf16>
+      ktdp.store %inserted_slice, %0 : tensor<1x128x64xf16>, <1x128x64xindex>
+    }
+    return
+  }
+}
