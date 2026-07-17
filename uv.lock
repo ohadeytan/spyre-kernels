@@ -127,8 +127,8 @@ wheels = [
 
 [[package]]
 name = "ktir-cpu"
-version = "0.1.dev62+g51e54f6fe"
-source = { git = "https://github.com/torch-spyre/ktir-cpu?rev=51e54f6fe4#51e54f6fe407a35e8def2ff3443f436b16130949" }
+version = "0.1.dev67+g67d6fb6f1"
+source = { git = "https://github.com/torch-spyre/ktir-cpu?rev=67d6fb6f1b#67d6fb6f1b80e05f5adb48d5dffd3608ede9b4c6" }
 dependencies = [
     { name = "numpy" },
 ]
@@ -538,7 +538,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ktir-cpu", marker = "extra == 'test'", git = "https://github.com/torch-spyre/ktir-cpu?rev=51e54f6fe4" },
+    { name = "ktir-cpu", marker = "extra == 'test'", git = "https://github.com/torch-spyre/ktir-cpu?rev=67d6fb6f1b" },
     { name = "numpy", specifier = ">=2.2.6" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0" },
     { name = "torch", specifier = ">=2.4.0" },

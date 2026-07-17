@@ -1,0 +1,117 @@
+// Generated from kernels/prefill_attention/spyre_gqa.py by scripts/gen_ktir.py
+// Source: kernels/prefill_attention/lower.py -> VARIANTS['spyre_gqa'].
+// DO NOT EDIT BY HAND — regenerate with:
+//     .venv/bin/python scripts/gen_ktir.py prefill_attention:spyre_gqa
+
+#map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+#map1 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map2 = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0, d2 >= 0, -d2 + 127 >= 0, d3 >= 0, -d3 + 63 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set2 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 127 >= 0, d3 >= 0, -d3 + 63 >= 0)>
+#set3 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 127 >= 0)>
+#set4 = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 >= 0, d2 >= 0, -d2 + 127 >= 0, d3 >= 0, -d3 + 63 >= 0)>
+#set5 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+  func.func @_prefill_attention_kernel_spyre(%arg0: index, %arg1: index, %arg2: index, %arg3: index, %arg4: f32, %arg5: index, %arg6: i32, %arg7: i32, %arg8: i32, %arg9: i32, %arg10: i32, %arg11: i32, %arg12: i32, %arg13: i32, %arg14: i32) attributes {grid = [32]} {
+    %c0 = arith.constant 0 : index
+    %cst = arith.constant 0.000000e+00 : f32
+    %cst_0 = arith.constant 0xFF800000 : f32
+    %cst_1 = arith.constant dense<0.000000e+00> : tensor<1x128x1xf32>
+    %cst_2 = arith.constant dense<0xFF800000> : tensor<1x128xf32>
+    %cst_3 = arith.constant dense<0.000000e+00> : tensor<1x128xf32>
+    %c1_i32 = arith.constant 1 : i32
+    %cst_4 = arith.constant dense<0.000000e+00> : tensor<1x128x128xf32>
+    %c2_i32 = arith.constant 2 : i32
+    %c4_i32 = arith.constant 4 : i32
+
+    %pid = ktdp.get_compute_tile_id : index
+    %pid_5 = arith.index_cast %pid : index to i32
+    %work_end = arith.addi %pid_5, %c1_i32 : i32
+    %work_end_6 = arith.minsi %work_end, %c4_i32 : i32
+    %q_desc = arith.index_cast %arg6 : i32 to index
+    %q_desc_7 = arith.index_cast %arg7 : i32 to index
+
+    %q_desc_8 = ktdp.construct_memory_view %arg0, sizes: [1, 4, 128, 64], strides: [64, %q_desc, %q_desc_7, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x4x128x64xf16>
+    %k_desc = arith.index_cast %arg8 : i32 to index
+    %k_desc_9 = arith.index_cast %arg9 : i32 to index
+
+    %k_desc_10 = ktdp.construct_memory_view %arg1, sizes: [2, 128, 64], strides: [%k_desc, %k_desc_9, 1] {coordinate_set = #set1, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<2x128x64xf16>
+    %v_desc = arith.index_cast %arg10 : i32 to index
+    %v_desc_11 = arith.index_cast %arg11 : i32 to index
+
+    %v_desc_12 = ktdp.construct_memory_view %arg2, sizes: [1, 2, 128, 64], strides: [64, %v_desc, %v_desc_11, 1] {coordinate_set = #set2, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x2x128x64xf16>
+    %o_desc = arith.index_cast %arg12 : i32 to index
+    %o_desc_13 = arith.index_cast %arg13 : i32 to index
+
+    %o_desc_14 = ktdp.construct_memory_view %arg5, sizes: [1, 4, 128, 64], strides: [64, %o_desc, %o_desc_13, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x4x128x64xf16>
+    %m_desc = arith.index_cast %arg14 : i32 to index
+
+    %m_desc_15 = ktdp.construct_memory_view %arg3, sizes: [128, 128], strides: [%m_desc, 1] {coordinate_set = #set3, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<128x128xf32>
+
+    scf.for %arg15 = %pid_5 to %work_end_6 step %c1_i32  : i32 {
+      %kv_head = arith.divsi %arg15, %c2_i32 : i32
+      %q = arith.index_cast %arg15 : i32 to index
+
+      %q_16 = ktdp.construct_access_tile %q_desc_8[%c0, %q, %c0, %c0] {access_tile_order = #map, access_tile_set = #set4} : memref<1x4x128x64xf16> -> !ktdp.access_tile<1x1x128x64xindex>
+      %q_17 = ktdp.load %q_16 : <1x1x128x64xindex> -> tensor<1x1x128x64xf16>
+      %k = arith.index_cast %kv_head : i32 to index
+
+      %k_18 = ktdp.construct_access_tile %k_desc_10[%k, %c0, %c0] {access_tile_order = #map1, access_tile_set = #set5} : memref<2x128x64xf16> -> !ktdp.access_tile<1x128x64xindex>
+      %k_19 = ktdp.load %k_18 : <1x128x64xindex> -> tensor<1x128x64xf16>
+      %qk = tensor.empty() : tensor<1x64x128xf16>
+      %qk_20 = linalg.transpose ins(%k_19 : tensor<1x128x64xf16>) outs(%qk : tensor<1x64x128xf16>) permutation = [0, 2, 1]
+      %qk_21 = tensor.extract_slice %q_17[0, 0, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<1x1x128x64xf16> to tensor<1x128x64xf16>
+      %qk_22 = linalg.batch_matmul ins(%qk_21, %qk_20 : tensor<1x128x64xf16>, tensor<1x64x128xf16>) outs(%cst_4 : tensor<1x128x128xf32>) -> tensor<1x128x128xf32>
+      %qk_23 = tensor.empty() : tensor<1x128x128xf32>
+      %qk_24 = linalg.fill ins(%arg4 : f32) outs(%qk_23 : tensor<1x128x128xf32>) -> tensor<1x128x128xf32>
+      %qk_25 = arith.mulf %qk_22, %qk_24 : tensor<1x128x128xf32>
+
+      %qk_26 = ktdp.construct_access_tile %m_desc_15[%c0, %c0] {access_tile_order = #map2, access_tile_set = #set3} : memref<128x128xf32> -> !ktdp.access_tile<128x128xindex>
+      %qk_27 = ktdp.load %qk_26 : <128x128xindex> -> tensor<128x128xf32>
+      %qk_28 = tensor.expand_shape %qk_27 [[0, 1], [2]] output_shape [1, 128, 128] : tensor<128x128xf32> into tensor<1x128x128xf32>
+      %qk_29 = arith.addf %qk_25, %qk_28 : tensor<1x128x128xf32>
+      %m_ij = tensor.empty() : tensor<1x128xf32>
+      %m_ij_30 = linalg.fill ins(%cst_0 : f32) outs(%m_ij : tensor<1x128xf32>) -> tensor<1x128xf32>
+      %m_ij_31 = linalg.reduce ins(%qk_29 : tensor<1x128x128xf32>) outs(%m_ij_30 : tensor<1x128xf32>) dimensions = [2] 
+        (%qk_49: f32, %m_ij_50: f32) {
+          %m_ij_51 = arith.maxnumf %qk_49, %m_ij_50 : f32
+          linalg.yield %m_ij_51 : f32
+        }
+      %m_ij_32 = arith.maxnumf %m_ij_31, %cst_2 : tensor<1x128xf32>
+      %qk_33 = linalg.broadcast ins(%m_ij_32 : tensor<1x128xf32>) outs(%qk_23 : tensor<1x128x128xf32>) dimensions = [2]
+      %qk_34 = arith.subf %qk_29, %qk_33 : tensor<1x128x128xf32>
+      %p = math.exp %qk_34 : tensor<1x128x128xf32>
+      %l_ij = linalg.fill ins(%cst : f32) outs(%m_ij : tensor<1x128xf32>) -> tensor<1x128xf32>
+      %l_ij_35 = linalg.reduce ins(%p : tensor<1x128x128xf32>) outs(%l_ij : tensor<1x128xf32>) dimensions = [2] 
+        (%p_49: f32, %l_ij_50: f32) {
+          %l_ij_51 = arith.addf %p_49, %l_ij_50 : f32
+          linalg.yield %l_ij_51 : f32
+        }
+      %alpha = arith.subf %cst_2, %m_ij_32 : tensor<1x128xf32>
+      %alpha_36 = math.exp %alpha : tensor<1x128xf32>
+      %l_i = arith.mulf %alpha_36, %cst_3 : tensor<1x128xf32>
+      %l_i_37 = arith.addf %l_i, %l_ij_35 : tensor<1x128xf32>
+      %acc = tensor.expand_shape %alpha_36 [[0], [1, 2]] output_shape [1, 128, 1] : tensor<1x128xf32> into tensor<1x128x1xf32>
+      %acc_38 = arith.mulf %acc, %cst_1 : tensor<1x128x1xf32>
+      %acc_39 = tensor.collapse_shape %acc_38 [[0], [1, 2]] : tensor<1x128x1xf32> into tensor<1x128xf32>
+      %acc_40 = tensor.empty() : tensor<1x128x64xf32>
+      %acc_41 = linalg.broadcast ins(%acc_39 : tensor<1x128xf32>) outs(%acc_40 : tensor<1x128x64xf32>) dimensions = [2]
+
+      %v = ktdp.construct_access_tile %v_desc_12[%c0, %k, %c0, %c0] {access_tile_order = #map, access_tile_set = #set4} : memref<1x2x128x64xf16> -> !ktdp.access_tile<1x1x128x64xindex>
+      %v_42 = ktdp.load %v : <1x1x128x64xindex> -> tensor<1x1x128x64xf16>
+      %p_43 = arith.truncf %p : tensor<1x128x128xf32> to tensor<1x128x128xf16>
+      %acc_44 = tensor.extract_slice %v_42[0, 0, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<1x1x128x64xf16> to tensor<1x128x64xf16>
+      %acc_45 = linalg.batch_matmul ins(%p_43, %acc_44 : tensor<1x128x128xf16>, tensor<1x128x64xf16>) outs(%acc_41 : tensor<1x128x64xf32>) -> tensor<1x128x64xf32>
+      %acc_46 = linalg.broadcast ins(%l_i_37 : tensor<1x128xf32>) outs(%acc_40 : tensor<1x128x64xf32>) dimensions = [2]
+      %acc_47 = arith.divf %acc_45, %acc_46 : tensor<1x128x64xf32>
+      %acc_48 = arith.truncf %acc_47 : tensor<1x128x64xf32> to tensor<1x128x64xf16>
+
+      %0 = ktdp.construct_access_tile %o_desc_14[%c0, %q, %c0, %c0] {access_tile_order = #map, access_tile_set = #set4} : memref<1x4x128x64xf16> -> !ktdp.access_tile<1x1x128x64xindex>
+      %1 = tensor.empty() : tensor<1x1x128x64xf16>
+      %inserted_slice = tensor.insert_slice %acc_48 into %1[0, 0, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<1x128x64xf16> into tensor<1x1x128x64xf16>
+      ktdp.store %inserted_slice, %0 : tensor<1x1x128x64xf16>, <1x1x128x64xindex>
+    }
+    return
+  }
+}
