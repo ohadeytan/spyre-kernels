@@ -448,7 +448,7 @@ def test_prefill_attention_ktir_large_values():
 
 # The SEQ=256 (two-BLOCK) variants exercise a query-block spanning more than one
 # KV tile, so they cover the online-softmax rescaling across tiles. Requires the
-# ktir-cpu outs-materialization fix (pin rev 67d6fb6f) for correct accumulation
+# ktir-cpu outs-materialization fix (pin rev 78a05609) for correct accumulation
 # across KV iterations.
 
 

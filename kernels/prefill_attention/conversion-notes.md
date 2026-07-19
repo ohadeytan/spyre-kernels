@@ -96,7 +96,7 @@
   cannot run on stock PyPI Triton, and the `td` kernel's GPU test covers the
   descriptor logic against the vLLM reference.
 - **Dep pins:** torch-spyre/triton PR #19 (`a6938df5`, `dispatchBatchMatmul` — open
-  PR branch) and ktir-cpu `67d6fb6f` (#149 `outs`-materialization fix, on main).
+  PR branch) and ktir-cpu `78a05609` (main; includes the #149 `outs`-materialization fix).
 
 ### Capability ledger vs. `original.py` / `td`
 
