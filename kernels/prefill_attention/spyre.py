@@ -17,6 +17,8 @@ def _prefill_attention_kernel_spyre(
     Mask,
     sm_scale,
     Out,
+    SEQ,      # runtime i32: query/key length of this request
+    SEQ_KV,   # runtime i32: padded key length = cdiv(SEQ, BLOCK_N) * BLOCK_N
     stride_qh,
     stride_qbs,
     stride_kh,
@@ -28,8 +30,6 @@ def _prefill_attention_kernel_spyre(
     stride_mm,
     HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr,
-    SEQ: tl.constexpr,
-    SEQ_KV: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     STICK: tl.constexpr,
@@ -44,9 +44,20 @@ def _prefill_attention_kernel_spyre(
     - **3D descriptors** ``[HEADS, SEQ, DMODEL]`` (K/V: ``[KV_HEADS, …]``) with the
       head as the *batch* axis (logical dim 0). ``tl.dot`` over the trailing two
       dims lowers to ``linalg.batch_matmul`` via the pass's ``dispatchBatchMatmul``
-      (PR #19, commit ``a6938df5``). No host per-head slicing / launch: one launch
-      covers every head. The head is an *identity* dim in each marker (a bare
-      ``0``), so it passes through the physicalization untouched.
+      (PR #19). No host per-head slicing / launch: one launch covers every head.
+      The head is an *identity* dim in each marker (a bare ``0``), so it passes
+      through the physicalization untouched.
+    - **Variable length.** ``SEQ`` (and its key-padded ``SEQ_KV``) are **runtime
+      i32 args**, so one lowered kernel serves any per-request length. ``SEQ``
+      feeds the **dynamic descriptor extent** ``shape=[HEADS, SEQ, Lk]`` (the
+      sequence axis is a ``memref<…x?x…>`` kDynamic dim; strides and
+      ``block_shape`` stay compile-time constant, as the pass requires) and the
+      **runtime KV-loop bound** ``range(0, SEQ, BLOCK_N)`` / ``m_blocks =
+      cdiv(SEQ, BLOCK_M)`` (an ``scf.for`` with a runtime trip count). The length
+      arrives as an arg (the caller reads ``B_Seqlen[req]`` on the host) rather
+      than a ``tl.load(B_Seqlen + req)`` scalar load, whose rank-0 view the
+      ktir-cpu oracle does not execute. A packed/ragged base offset (``tt.addptr``
+      into a descriptor base) is a compiler gap.
     - **GQA.** ``KV_HEADS`` may be fewer than ``HEADS`` (grouped-query attention):
       each query head ``h`` shares the KV head ``h // (HEADS // KV_HEADS)``. The
       sharing is resolved at the descriptor *load index* (``k_desc.load([kv_head,
@@ -72,7 +83,6 @@ def _prefill_attention_kernel_spyre(
       that flows straight into ``tl.dot(p, v)``; ``V`` is marked (stick-on-DMODEL).
     - No ``tl.arange``: masking is the additive host tensor ``Mask[SEQ, SEQ_KV]``
       (broadcast across heads — the causal/validity mask is head-independent).
-    - ``SEQ`` is a compile-time constant, so no per-batch scalar loads.
     - Distribution loop over the (head, query-block) work space (any core count).
     - **Fixed multi-request batch** (uniform sequence length) folds into the head
       axis: a batch of ``B`` requests is ``B * HEADS`` independent attention

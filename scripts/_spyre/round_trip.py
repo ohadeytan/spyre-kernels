@@ -16,9 +16,10 @@ the ~3 helpers we actually use lets the spyre backend come from an ordinary
 Upstream origin
 ---------------
   repo: https://github.com/fabianlim/triton   (PR #19, torch-spyre/triton#19)
-  rev:  a6938df5  (3.7.0+gita6938df5; branch inbue-metadata-v2 head — provides
-        the RewriteDescriptorLayout linalg.batch_matmul dispatch the multi-head
-        prefill kernel needs.)
+  rev:  92dffea6  (3.7.0+git92dffea6; branch inbue-metadata-v2 head) — provides
+        the RewriteDescriptorLayout linalg.batch_matmul + reduce dispatch the
+        multi-head prefill kernel needs, and the LowerScalarLoad pass (#52) the
+        dynamic descriptor extent needs.
   files: third_party/spyre/scripts/dump_round_trip.py  (--driver path only)
          third_party/spyre/test/utils.py                (compile_to_ttir, make_ktir_mod)
          third_party/spyre/scripts/_patterns/__init__.py (clean_ir)

@@ -67,7 +67,7 @@
   distribution loop flattens the `(head, query-block)` work space, so one launch
   covers every head with no host per-head slicing. Answers issue #3 Q1/Q3.
 - **KTIR-runnability constraints:** descriptors only (no `tt.addptr` on args →
-  `batch==1`, `SEQ` constexpr, no `B_Seqlen`/`B_Start_Loc` scalar loads); no
+  no packed/ragged per-request *base* rebasing; single request per launch); no
   `tl.arange` (masking is the additive host tensor `Mask[SEQ, SEQ_KV]`, 0.0 / −1e8,
   added to the scaled scores); `tl.exp` not `exp2` (ktir-cpu has `math.exp`, not
   `math.exp2`) with a plain `sm_scale` (no `1/ln2`) — `exp(s·qk) == exp2((s/ln2)·qk)`.
@@ -75,28 +75,52 @@
     −1e8 pad columns. A descriptor zero-fills OOB lanes and 0.0 means "attend" in an
     additive mask, so without the pad a partial final key tile would let
     out-of-range keys (zero-filled K/V) leak in.
+- **Variable length (runtime `SEQ`, single kernel).** `SEQ`/`SEQ_KV` are **runtime
+  `i32` args**, not `constexpr`, so the one lowered kernel serves any per-request
+  length. Every variant below (base, GQA, pad, batch, dist) is this same kernel;
+  the length is supplied at execution time, never baked. `SEQ` drives:
+  - **Dynamic descriptor extent** — `shape=[HEADS, SEQ, Lk]` with runtime `SEQ`
+    lowers the sequence axis to a `?` (kDynamic) memref dim (`memref<1x4x?x64xf16>`);
+    `strides`/`block_shape` stay compile-time constant, as the pass requires (only
+    full extents may be dynamic). This is the pass's dynamic-extent path (#52).
+  - **Runtime KV-loop bound** — `for start_n in range(0, SEQ, BLOCK_N)` is an
+    `scf.for` with a runtime trip count (`%arg = SEQ`), not an unrolled constexpr
+    range; `m_blocks = cdiv(SEQ, BLOCK_M)` and the work partition are likewise
+    runtime. The head axis still batches (`linalg.batch_matmul` survives).
+  - **Length passed as an arg, not `tl.load(B_Seqlen + req)`.** #52's `LowerScalarLoad`
+    *lowers* the scalar-load form, but the rank-0 view it emits is not yet executable
+    on the ktir-cpu oracle (three localized rank-0 gaps: two parser regexes + a
+    rank-0 `AffineMap` eval). Passing the length as a runtime arg is the equivalent
+    capability that runs on the oracle **today**; the caller reads `B_Seqlen[req]`
+    on the host. Only a *packed/ragged* base offset (`tt.addptr` into a descriptor
+    base) remains a genuine compiler gap.
 - **Invariants:** distribution loop over the `(head, query-block)` work space
   (`HEADS * cdiv(SEQ, BLOCK_M)` items) via `tl.program_id`/`tl.num_programs` +
   `cdiv`/`minimum` — a flat `[num_cores]` grid, partition-invariant for any core
-  count. Fixed constexpr tiles.
-- **Signature:** `Q/K/V/Mask/Out` + per-head strides (head + row stride for each of
-  Q/K/V/O, plus `stride_mm` for the mask row); constexprs `HEADS` / `KV_HEADS` /
-  `SEQ` / `SEQ_KV` / `BLOCK_M` / `BLOCK_N` / `STICK` / `Lk` / `DMODEL`. Causal and
-  sliding-window are encoded in the host mask (not signature args); the mask carries
-  no head stride (head-independent).
+  count. Fixed constexpr tiles; the work-space size is runtime (depends on `SEQ`).
+- **Signature:** `Q/K/V/Mask/Out`, then the runtime `i32` `SEQ` / `SEQ_KV` (right
+  after `Out`), then per-head strides (head + row stride for each of Q/K/V/O, plus
+  `stride_mm` for the mask row); constexprs `HEADS` / `KV_HEADS` / `BLOCK_M` /
+  `BLOCK_N` / `STICK` / `Lk` / `DMODEL`. Causal and sliding-window are encoded in
+  the host mask (not signature args); the mask carries no head stride
+  (head-independent).
 - **Tests:** `tests/ktir/test_prefill_attention.py` on ktir-cpu vs a NumPy
   attention reference applied per head and stacked — causal, zeros, moderate-scale
   rescaling, per-head equivalence (batched matmul does not mix heads),
   **sliding-window** (backward / forward / band, host-mask only), **GQA**
   (`spyre_gqa`, 4q/2kv), **head-dim padding** (`spyre_pad`, `Lk=48 → DMODEL=64`),
-  **fixed batch** (`spyre_batch`, B=2×4 heads folded), a `linalg.batch_matmul`-present
-  assertion (no surviving `tt.dot` / `spyre_tensor_layout`), and **distribution
-  invariance** (grids `[1, 4, 16, 32]`, `spyre_dist_c*`, SEQ=256 two-query-block ×
-  HEADS — must match the reference and agree bitwise). No GPU test: the marked kernel
-  cannot run on stock PyPI Triton, and the `td` kernel's GPU test covers the
-  descriptor logic against the vLLM reference.
-- **Dep pins:** torch-spyre/triton PR #19 (`a6938df5`, `dispatchBatchMatmul` — open
-  PR branch) and ktir-cpu `78a05609` (main; includes the #149 `outs`-materialization fix).
+  **fixed batch** (`spyre_batch`, B=2×4 heads folded), **variable length**
+  (base `spyre.ktir` run at runtime `SEQ ∈ {256, 128, 100, 64}` — 256 spans two KV
+  tiles so the runtime-bound loop iterates and rescales; plus a dynamic-`?`-extent
+  assertion), a `linalg.batch_matmul`-present assertion (no surviving
+  `tt.dot` / `spyre_tensor_layout`), and **distribution invariance** (grids
+  `[1, 4, 16, 32]`, `spyre_dist_c*`, SEQ=256 two-query-block × HEADS — must match the
+  reference and agree bitwise). No GPU test: the marked kernel cannot run on stock
+  PyPI Triton, and the `td` kernel's GPU test covers the descriptor logic against
+  the vLLM reference.
+- **Dep pins:** torch-spyre/triton PR #19 (`92dffea6`, `inbue-metadata-v2` head —
+  `dispatchBatchMatmul` + reduce dispatch + #52's `LowerScalarLoad`) and ktir-cpu
+  `78a05609` (main; includes the #149 `outs`-materialization fix).
 
 ### Capability ledger vs. `original.py` / `td`
 
@@ -115,11 +139,13 @@ defines "no dropped capabilities." Each row is **kept** or a **compiler gap**
 | Fixed multi-request batch, uniform seqlen | **kept** (head-axis fold) | a batch of `B` uniform-length requests = `B*HEADS` independent problems, so the host lays Q/K/V/O out as `[B*HEADS, SEQ, Lk]` and the unchanged kernel runs it. Correct only when the mask is shared across requests (uniform-length prefill). |
 | Head dim spanning > 1 stick (fp32 `Lk=64`, `Lk > 64`) | **compiler gap** | the pass "D3 guard" (`dispatchSource`) rejects `physBlock > 1` on a *parallel* floor dim — V's/O's head dim in P·V (*"does not yet support multi-stick parallel floor dims"*). Reduction-axis multi-stick (QK^T) is fine. |
 | Native 4D `[B, HEADS, SEQ, Lk]` batch descriptor | **compiler gap** | `LowerDescriptorMemory` rejects the collapsed-leading-dim `tt.dot` (`'ktdp.load' access tile shape must match result tensor shape`); the pass has no two-batch-dim matmul handler (only `BatchMatmulOp`, one batch dim). Use the head-axis fold instead. |
-| Variable-length / packed ragged batch (`B_Start_Loc` / `B_Seqlen`) | **compiler gap** | per-request base rebasing needs `tt.addptr` into a `make_tensor_descriptor` base — the `bmm_addptr` fixtures are `"disabled"` (`test_lower_desc_memory.py::TestAddptrIntoDescriptor`). Dynamic extents themselves lower (`bmm_dynamic`); only the ragged/packed offset and the runtime seqlen scalar load are blocked. |
+| Variable-length (per-request `SEQ`, unpacked) | **kept** | `SEQ`/`SEQ_KV` are runtime `i32` args → dynamic descriptor extent (`memref<…x?x…>`) + runtime-bound KV `scf.for`; head axis still batches. The one `_prefill_attention_kernel_spyre` is varlen by construction (GQA/pad/batch/dist are lowerings of it). The caller passes the per-request length as an arg (reads `B_Seqlen[req]` on the host). Validated on ktir-cpu at `SEQ ∈ {256,128,100,64}`. |
+| Packed / ragged batch (`B_Start_Loc` base rebasing) | **compiler gap** | per-request *base* rebasing needs `tt.addptr` into a `make_tensor_descriptor` base — the `bmm_addptr` fixtures are `"disabled"` (`test_lower_desc_memory.py::TestAddptrIntoDescriptor`). The runtime *seqlen scalar load* (`tl.load(B_Seqlen+req)`) lowers via #52 but its rank-0 view is not executable on ktir-cpu (3 localized rank-0 gaps); the length is passed as a runtime arg instead. Only the packed base offset is blocked. |
 
 **Bottom line:** relative to `td`, Proposal 2 keeps the flash core, multi-head,
-causal, sliding-window, GQA, single-stick padded head dims, and fixed uniform-length
-batch — with no Proposal-1 technique (logical descriptors + markers throughout, no
-hand-authored physical layout / reshape). The remaining gaps — multi-stick parallel
-head dims, native 4D batch descriptors, and ragged variable-length batching — are
-all compiler-bound, not authoring choices.
+causal, sliding-window, GQA, single-stick padded head dims, fixed uniform-length
+batch, and unpacked per-request variable length (runtime `SEQ` arg) — with no
+Proposal-1 technique (logical descriptors + markers throughout, no hand-authored
+physical layout / reshape). The remaining gaps — multi-stick parallel head dims,
+native 4D batch descriptors, and *packed/ragged* batching (per-request base
+rebasing) — are all compiler-bound, not authoring choices.

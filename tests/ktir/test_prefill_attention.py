@@ -4,10 +4,11 @@
 The KTIR under test is *generated* from ``kernels/prefill_attention/spyre.py``
 by ``scripts/gen_ktir.py`` (driver: ``kernels/prefill_attention/lower.py``), so
 the function name and signature mirror the lowered kernel exactly. The Spyre
-kernel is the single-request, **all-heads** form: ``SEQ`` is a compile-time
-constant, the head is the *batch* axis of 3D ``[HEADS, SEQ, HEAD_DIM]``
-descriptors, the causal mask is an additive host tensor, and there is no
-``tl.arange`` — the properties that let it lower to KTIR with live
+kernel is the single-request, **all-heads** form: ``SEQ`` / ``SEQ_KV`` are
+**runtime i32 args** (dynamic descriptor extent + runtime KV-loop bound, so one
+.ktir serves any length), the head is the *batch* axis of 3D ``[HEADS, SEQ,
+HEAD_DIM]`` descriptors, the causal mask is an additive host tensor, and there is
+no ``tl.arange`` — the properties that let it lower to KTIR with live
 ``tl.spyre_tensor_layout`` markers and run on ktir-cpu.
 
 Every head is handled in **one launch**: ``tl.dot`` over the trailing two dims
@@ -145,16 +146,21 @@ def numpy_reference_gqa(q, k, v, mask, sm_scale):
     )
 
 
-def _run(q, k, v, mask, sm_scale, *, mlir_path=MLIR_PATH, seq=SEQ):
+def _run(q, k, v, mask, sm_scale, *, mlir_path=MLIR_PATH, seq=SEQ, seq_kv=None):
     """Execute the generated KTIR. q/k/v/o are 3D [heads, seq, dmodel]; the mask
-    is 2D [seq, seq] (head-independent). Constexprs (HEADS, KV_HEADS, SEQ, BLOCK,
-    Lk, DMODEL, …) are baked into the KTIR — only pointers, sm_scale, and the 9
-    i32 strides are passed at runtime (arg order verified against the signature).
+    is 2D [seq, seq_kv] (head-independent). Compile-time constexprs (HEADS,
+    KV_HEADS, BLOCK, Lk, DMODEL) are baked into the KTIR; SEQ / SEQ_KV are
+    **runtime i32 args** (dynamic descriptor extent + runtime KV-loop bound), so
+    one .ktir serves any length. Passed at runtime: pointers, sm_scale, SEQ,
+    SEQ_KV, and the 9 i32 strides (arg order verified against the KTIR signature:
+    arg6=SEQ, arg7=SEQ_KV, arg8..=strides).
 
     Strides are derived from each array's own PHYSICAL shape, so this handles all
     variants uniformly: GQA (K/V carry fewer heads than Q) and head-dim padding
     (the physical last dim = DMODEL, so the per-token row stride grows) just fall
     out of the input shapes the caller passes."""
+    if seq_kv is None:
+        seq_kv = mask.shape[1]
     interp = KTIRInterpreter()
     interp.load(mlir_path.read_text())
 
@@ -174,18 +180,20 @@ def _run(q, k, v, mask, sm_scale, *, mlir_path=MLIR_PATH, seq=SEQ):
         arg0=q,                        # Q    [HEADS, seq, DMODEL]
         arg1=k,                        # K    [KV_HEADS, seq, DMODEL]
         arg2=v,                        # V    [KV_HEADS, seq, DMODEL]
-        arg3=mask,                     # Mask [seq, seq] f32
+        arg3=mask,                     # Mask [seq, seq_kv] f32
         arg4=np.float32(sm_scale),     # sm_scale
         arg5=o,                        # Out  [HEADS, seq, DMODEL]
-        arg6=qh,                       # stride_qh
-        arg7=qbs,                      # stride_qbs
-        arg8=kh,                       # stride_kh
-        arg9=kbs,                      # stride_kbs
-        arg10=vh,                      # stride_vh
-        arg11=vbs,                     # stride_vbs
-        arg12=oh,                      # stride_oh
-        arg13=obs,                     # stride_obs
-        arg14=np.int32(seq),           # stride_mm (mask row stride = SEQ_KV = seq)
+        arg6=np.int32(seq),            # SEQ (runtime)
+        arg7=np.int32(seq_kv),         # SEQ_KV (runtime)
+        arg8=qh,                       # stride_qh
+        arg9=qbs,                      # stride_qbs
+        arg10=kh,                      # stride_kh
+        arg11=kbs,                     # stride_kbs
+        arg12=vh,                      # stride_vh
+        arg13=vbs,                     # stride_vbs
+        arg14=oh,                      # stride_oh
+        arg15=obs,                     # stride_obs
+        arg16=np.int32(seq_kv),        # stride_mm (mask row stride = SEQ_KV)
     )
     return outputs["arg5"]
 
@@ -252,11 +260,10 @@ def test_prefill_attention_ktir_causal():
 )
 def test_prefill_attention_ktir_sliding_window(window_q, window_k):
     """Sliding-window attention is a pure host-mask change — the same generated
-    KTIR handles it with no kernel modification. This reclaims the original
-    ``_fwd_kernel``'s SLIDING_WINDOW_Q / SLIDING_WINDOW_K capability, which the
-    marked kernel folds entirely into the additive host mask (a window is just a
-    different set of MASK_NEG entries). Causal is enabled iff a backward window
-    is set, mirroring the original's typical causal+window use.
+    KTIR handles it with no kernel modification. The SLIDING_WINDOW_Q /
+    SLIDING_WINDOW_K semantics fold entirely into the additive host mask (a window
+    is just a different set of MASK_NEG entries). Causal is enabled iff a backward
+    window is set.
     """
     q, k, v = _make_inputs()
     mask = build_additive_mask(
@@ -291,10 +298,10 @@ def _require_variant(path: Path):
     """Skip (not fail) if an optional variant's .ktir was not generated."""
     if not path.is_file():
         pytest.skip(
-            f"{path.name} not generated — regenerate with:\n"
+            f"{path.name} not generated — regenerate with the SPYRE_TRITON pin "
+            "from .github/workflows/ci.yaml:\n"
             "  GIT_PAT=$(gh auth token) TRITON_DEFAULT_BACKEND=spyre uv run "
-            '--with "triton @ git+https://github.com/fabianlim/triton@a6938df5" '
-            "python scripts/gen_ktir.py prefill_attention"
+            '--with "$SPYRE_TRITON" python scripts/gen_ktir.py prefill_attention'
         )
 
 
@@ -419,6 +426,63 @@ def test_prefill_attention_ktir_fixed_batch():
 
 
 @pytest.mark.ktir_cpu
+@pytest.mark.parametrize("seq", [256, 128, 100, 64])
+def test_prefill_attention_ktir_varlen(seq):
+    """Variable-length prefill: the base ``spyre.ktir`` runs several runtime
+    sequence lengths. SEQ / SEQ_KV are runtime i32 args (dynamic descriptor
+    extent + runtime KV-loop bound), so the single lowered kernel serves any
+    per-request length.
+
+    seq=256 spans two BLOCK=128 KV tiles, so the runtime-bound KV loop iterates
+    twice — exercising the online-softmax cross-tile rescaling with a dynamic
+    trip count (one scf.for over a runtime SEQ). seq=128 is a single-tile BLOCK
+    multiple; seq=100 and seq=64 are shorter than BLOCK=128, exercising a dynamic
+    descriptor extent < the tile. SEQ_KV pads the key axis to a BLOCK_N multiple
+    with MASK_NEG columns so the zero-filled OOB keys of a ragged final tile never
+    leak in. The reference is the same causal attention at that length.
+    """
+    seq_kv = ((seq + 127) // 128) * 128  # cdiv(seq, BLOCK_N) * BLOCK_N
+    rng = np.random.default_rng(42)
+    shape = (HEADS, seq, HEAD_DIM)
+    q = rng.standard_normal(shape).astype(np.float16)
+    k = rng.standard_normal(shape).astype(np.float16)
+    v = rng.standard_normal(shape).astype(np.float16)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    # Mask is [seq, seq_kv]: causal over the real range, MASK_NEG on the padded
+    # key columns [seq, seq_kv) so the zero-filled OOB keys never leak in.
+    mask = np.full((seq, seq_kv), MASK_NEG, dtype=np.float32)
+    mask[:, :seq] = build_additive_mask(seq, is_causal=True)
+
+    result = _run(q, k, v, mask, sm_scale, seq=seq, seq_kv=seq_kv)
+    expected = numpy_reference_batched(q, k, v, mask[:, :seq], sm_scale)
+
+    assert result.shape == (HEADS, seq, HEAD_DIM)
+    np.testing.assert_allclose(
+        result.astype(np.float32), expected, rtol=2e-2, atol=2e-2,
+    )
+    for h in range(HEADS):
+        np.testing.assert_allclose(
+            result[h].astype(np.float32),
+            numpy_reference(q[h], k[h], v[h], mask[:, :seq], sm_scale),
+            rtol=2e-2, atol=2e-2,
+        )
+    max_err = np.max(np.abs(result.astype(np.float32) - expected))
+    print(f"PASS varlen seq={seq} (SEQ_KV={seq_kv}): max abs error = {max_err:.6f}")
+
+
+@pytest.mark.ktir_cpu
+def test_prefill_attention_ktir_dynamic_extent():
+    """The single kernel keeps the head-batched matmul and carries a dynamic (?)
+    sequence extent + a runtime-bound KV loop — SEQ is a runtime arg."""
+    text = MLIR_PATH.read_text()
+    assert "linalg.batch_matmul" in text, "QK^T / P·V did not batch over heads"
+    assert "tt.dot" not in text, "tt.dot survived lowering"
+    assert "spyre_tensor_layout" not in text, "layout marker not consumed"
+    assert "?x64xf16" in text, "sequence axis is not a dynamic (?) descriptor extent"
+
+
+@pytest.mark.ktir_cpu
 def test_prefill_attention_ktir_large_values():
     """Larger-magnitude inputs — exercises the online-softmax rescaling path.
 
@@ -471,10 +535,10 @@ class TestPrefillAttentionDistribution:
         path = _dist_mlir_path(cores)
         if not path.is_file():
             pytest.skip(
-                f"{path.name} not generated — regenerate with:\n"
+                f"{path.name} not generated — regenerate with the SPYRE_TRITON "
+                "pin from .github/workflows/ci.yaml:\n"
                 "  GIT_PAT=$(gh auth token) TRITON_DEFAULT_BACKEND=spyre uv run "
-                '--with "triton @ git+https://github.com/fabianlim/triton@a6938df5" '
-                "python scripts/gen_ktir.py prefill_attention"
+                '--with "$SPYRE_TRITON" python scripts/gen_ktir.py prefill_attention'
             )
         return path
 

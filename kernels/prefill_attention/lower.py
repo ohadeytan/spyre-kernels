@@ -12,24 +12,33 @@ the output ``.ktir`` stem) to the four things the round-trip lowering needs:
     CONSTEXPRS  : dict[str, value] for every constexpr arg
     GRID        : optional list, forwarded to SpyreOptions.grid
 
-The spyre variant is the single-request, all-heads form: ``SEQ`` is a
-compile-time constant, the head is the *batch* axis of 3D ``[HEADS, SEQ, Lk]``
-descriptors (QK^T / P·V lower to ``linalg.batch_matmul``), and the
-causal/validity mask is an additive host tensor — so the lowered kernel has
-live ``tl.spyre_tensor_layout`` markers, no ``tl.arange``, and no ``tt.addptr``
-/ ``tt.reshape`` glue.
+There is a single kernel, ``_prefill_attention_kernel_spyre``: the all-heads
+form where the head is the *batch* axis of 3D ``[HEADS, SEQ, Lk]`` descriptors
+(QK^T / P·V lower to ``linalg.batch_matmul``) and the causal/validity mask is an
+additive host tensor — so the lowered kernel has live ``tl.spyre_tensor_layout``
+markers, no ``tl.arange``, and no ``tt.addptr`` / ``tt.reshape`` glue.
+
+``SEQ`` and ``SEQ_KV`` are **runtime i32 args**, not constexpr, so one lowered
+kernel serves any per-request length (dynamic descriptor extent + runtime
+KV-loop bound). Each variant below is the *same* kernel lowered with different
+constexprs (head counts, head dim) or grid — GQA, head-dim padding, fixed batch,
+and the distribution grids are all lowerings of that one kernel. The per-request
+length is supplied at *execution* time by the test, not baked at lowering.
 """
 
 from kernels.prefill_attention.spyre import _prefill_attention_kernel_spyre
 
-# Concrete shapes match tests/ktir/test_prefill_attention.py: a single 128-token
-# sequence, head_dim 64, fp16, multiple heads in one launch (batched matmul).
+# Concrete shapes match tests/ktir/test_prefill_attention.py: head_dim 64, fp16,
+# multiple heads in one launch (batched matmul). SEQ is a runtime arg, so it is
+# not fixed at lowering — the test drives several lengths through one .ktir.
 _HEADS = 4
-_SEQ = 128
 _HEAD_DIM = 64
 _BLOCK = 128
 _STICK = 128 // 2  # fp16 -> 64 elems per 128-byte DataStick
 
+# SEQ / SEQ_KV are runtime i32 args (right after Out, before the strides),
+# matching _prefill_attention_kernel_spyre's parameter order. Everything that is
+# fixed at compile time (head counts, tile sizes, head dim) stays constexpr.
 _SPYRE_SIGNATURE = {
     "Q": "*fp16",
     "K": "*fp16",
@@ -37,6 +46,8 @@ _SPYRE_SIGNATURE = {
     "Mask": "*fp32",
     "sm_scale": "fp32",
     "Out": "*fp16",
+    "SEQ": "i32",       # runtime sequence length
+    "SEQ_KV": "i32",    # runtime padded key length = cdiv(SEQ, BLOCK_N) * BLOCK_N
     "stride_qh": "i32",
     "stride_qbs": "i32",
     "stride_kh": "i32",
@@ -48,8 +59,6 @@ _SPYRE_SIGNATURE = {
     "stride_mm": "i32",
     "HEADS": "i32",
     "KV_HEADS": "i32",
-    "SEQ": "i32",
-    "SEQ_KV": "i32",
     "BLOCK_M": "i32",
     "BLOCK_N": "i32",
     "STICK": "i32",
@@ -62,12 +71,11 @@ _SPYRE_SIGNATURE = {
 # the distribution loop is partition-independent means lowering the SAME kernel
 # at several grids and asserting ktir-cpu produces the same result for each.
 #
-# These use SEQ=256 (two BLOCK=128 query-blocks) and HEADS=4 so the work space
-# (HEADS * m_blocks = 8 items) is non-trivial to partition: grid [1] runs all 8
-# on one core, [4] gives each core 2, [16]/[32] leave most cores idle. With a
-# single query-block and one head every grid is degenerate and tests nothing.
+# SEQ is a runtime arg, so the work-space size (HEADS * cdiv(SEQ, BLOCK_M)) is
+# computed at runtime; the test drives SEQ=256 (two BLOCK=128 query-blocks) with
+# HEADS=4 so the work space (8 items) is non-trivial to partition: grid [1] runs
+# all 8 on one core, [4] gives each core 2, [16]/[32] leave most cores idle.
 # Tests: tests/ktir/test_prefill_attention.py::TestPrefillAttentionDistribution.
-_DIST_SEQ = 256
 _DIST_HEADS = 4
 
 
@@ -78,8 +86,6 @@ def _dist_variant(grid: int) -> dict:
         "CONSTEXPRS": {
             "HEADS": _DIST_HEADS,
             "KV_HEADS": _DIST_HEADS,  # 1:1 heads (no GQA) in the dist variants
-            "SEQ": _DIST_SEQ,
-            "SEQ_KV": _DIST_SEQ,  # SEQ is a BLOCK multiple -> no key padding
             "BLOCK_M": _BLOCK,
             "BLOCK_N": _BLOCK,
             "STICK": _STICK,
@@ -94,14 +100,14 @@ def _dist_variant(grid: int) -> dict:
 # *literal keys* (ast, no import), so every variant must appear as an explicit
 # key here — a loop that inserts keys afterward would be invisible to it.
 VARIANTS = {
+    # Base: 4 heads, 1:1 query:KV (multi-head attention), head dim 64. SEQ is a
+    # runtime arg, so this one .ktir serves any per-request length.
     "spyre": {
         "KERNEL": _prefill_attention_kernel_spyre,
         "SIGNATURE": _SPYRE_SIGNATURE,
         "CONSTEXPRS": {
             "HEADS": _HEADS,
             "KV_HEADS": _HEADS,  # 1:1 query:KV heads (multi-head attention)
-            "SEQ": _SEQ,
-            "SEQ_KV": _SEQ,  # SEQ is a BLOCK multiple here -> no key padding
             "BLOCK_M": _BLOCK,
             "BLOCK_N": _BLOCK,
             "STICK": _STICK,
@@ -121,8 +127,6 @@ VARIANTS = {
         "CONSTEXPRS": {
             "HEADS": _HEADS,        # 4 query heads
             "KV_HEADS": _HEADS // 2,  # 2 KV heads -> group size 2
-            "SEQ": _SEQ,
-            "SEQ_KV": _SEQ,
             "BLOCK_M": _BLOCK,
             "BLOCK_N": _BLOCK,
             "STICK": _STICK,
@@ -141,8 +145,6 @@ VARIANTS = {
         "CONSTEXPRS": {
             "HEADS": _HEADS,
             "KV_HEADS": _HEADS,
-            "SEQ": _SEQ,
-            "SEQ_KV": _SEQ,
             "BLOCK_M": _BLOCK,
             "BLOCK_N": _BLOCK,
             "STICK": _STICK,
@@ -162,8 +164,6 @@ VARIANTS = {
         "CONSTEXPRS": {
             "HEADS": 2 * _HEADS,      # BATCH(2) * HEADS(4) folded into the head axis
             "KV_HEADS": 2 * _HEADS,   # 1:1 within the fold (no GQA here)
-            "SEQ": _SEQ,
-            "SEQ_KV": _SEQ,
             "BLOCK_M": _BLOCK,
             "BLOCK_N": _BLOCK,
             "STICK": _STICK,
