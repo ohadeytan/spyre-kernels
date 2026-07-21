@@ -60,10 +60,10 @@ def attn_ref(q, k, v):
     return o
 
 
-def attn_spyre(q, k, v, mask=None, num_cores=32, block=32):
+def attn_spyre(q, k, v, mask=None, num_cores=32, block=32, **kwargs):
     o = torch.zeros_like(q)
     context_attention_fwd_spyre(
-        q, k, v, o, mask=mask, num_cores=num_cores, block=block
+        q, k, v, o, mask=mask, num_cores=num_cores, block=block, **kwargs
     )
     return o
 
@@ -151,3 +151,141 @@ class TestPrefillAttentionSpyreDistribution:
         out_spyre = attn_spyre(q, k, v, num_cores=num_cores, block=64)
 
         torch.testing.assert_close(out_spyre, out_ref, **TOL[dtype])
+
+
+# ─── Reclaimed capabilities vs the original kernel ────────────────────────────
+
+
+def _make_gqa(S, H, KVH, D, device, dtype=torch.float16, scale_in=0.1):
+    torch.manual_seed(42)
+    q = torch.randn(S, H, D, device=device, dtype=dtype) * scale_in
+    k = torch.randn(S, KVH, D, device=device, dtype=dtype) * scale_in
+    v = torch.randn(S, KVH, D, device=device, dtype=dtype) * scale_in
+    return q, k, v
+
+
+class TestPrefillAttentionSpyreCapabilities:
+    """GQA, sliding window, head-dim padding, and fixed multi-request batch —
+    each must match the vLLM-derived original ``_fwd_kernel`` (through the same
+    wrapper) on the reclaimed configuration."""
+
+    @pytest.mark.parametrize("H,KVH", [(4, 2), (8, 2), (8, 4)])
+    def test_gqa_matches_original(self, device, H, KVH):
+        """Grouped-query attention: fewer KV heads, query head h reads KV head
+        h // (H // KVH). The kernel already does this at the descriptor load
+        index; only the KV head count shrinks."""
+        dtype = torch.float16
+        S, D = 128, 64
+        q, k, v = _make_gqa(S, H, KVH, D, device, dtype)
+
+        # Reference: original kernel derives kv_group_num from the shapes.
+        o_ref = torch.zeros_like(q)
+        b_start_loc = torch.zeros(1, device=device, dtype=torch.int32)
+        b_seq_len = torch.tensor([S], device=device, dtype=torch.int32)
+        context_attention_fwd(q, k, v, o_ref, b_start_loc, b_seq_len, S, is_causal=True)
+
+        o_spyre = attn_spyre(q, k, v)
+        torch.testing.assert_close(o_spyre, o_ref, **TOL[dtype])
+
+    @pytest.mark.parametrize("W_Q,W_K", [(32, 0), (0, 32), (48, 16)])
+    def test_sliding_window_matches_original(self, device, W_Q, W_K):
+        """Sliding window Q/K: the window lives in the additive host mask; the
+        original applies it as in-kernel position bands. Both must agree."""
+        dtype = torch.float16
+        S, H, D = 128, 4, 64
+        q, k, v = _make(S, H, D, device, dtype)
+
+        o_ref = torch.zeros_like(q)
+        b_start_loc = torch.zeros(1, device=device, dtype=torch.int32)
+        b_seq_len = torch.tensor([S], device=device, dtype=torch.int32)
+        context_attention_fwd(
+            q, k, v, o_ref, b_start_loc, b_seq_len, S, is_causal=True,
+            sliding_window_q=W_Q, sliding_window_k=W_K,
+        )
+
+        o_spyre = attn_spyre(q, k, v, sliding_window_q=W_Q, sliding_window_k=W_K)
+        torch.testing.assert_close(o_spyre, o_ref, **TOL[dtype])
+
+    def test_head_dim_padding_matches_padded_original(self, device):
+        """Head-dim padding: a logical head dim not filling a full stick. Both
+        kernels run on the physically padded (zero-filled) buffer; compare the
+        logical columns. The original kernel masks the head-dim tail (mask_d);
+        the spyre kernel relies on the host zeros."""
+        dtype = torch.float16
+        S, H = 128, 4
+        Lk, Dpad = 48, 64
+        torch.manual_seed(42)
+        q = torch.zeros(S, H, Dpad, device=device, dtype=dtype)
+        k = torch.zeros(S, H, Dpad, device=device, dtype=dtype)
+        v = torch.zeros(S, H, Dpad, device=device, dtype=dtype)
+        q[:, :, :Lk] = torch.randn(S, H, Lk, device=device, dtype=dtype) * 0.1
+        k[:, :, :Lk] = torch.randn(S, H, Lk, device=device, dtype=dtype) * 0.1
+        v[:, :, :Lk] = torch.randn(S, H, Lk, device=device, dtype=dtype) * 0.1
+
+        # Reference: original kernel with logical Lk (it masks the head-dim tail).
+        o_ref = torch.zeros_like(q)
+        b_start_loc = torch.zeros(1, device=device, dtype=torch.int32)
+        b_seq_len = torch.tensor([S], device=device, dtype=torch.int32)
+        context_attention_fwd(
+            q, k, v, o_ref, b_start_loc, b_seq_len, S, is_causal=True,
+            softmax_scale=1.0 / (Lk ** 0.5),
+        )
+
+        o_spyre = torch.zeros_like(q)
+        from kernels.prefill_attention.wrapper import context_attention_fwd_spyre
+        context_attention_fwd_spyre(q, k, v, o_spyre, logical_head_dim=Lk)
+
+        torch.testing.assert_close(
+            o_spyre[:, :, :Lk], o_ref[:, :, :Lk], **TOL[dtype]
+        )
+
+    @pytest.mark.parametrize("B,H", [(2, 4), (3, 2)])
+    def test_fixed_batch_matches_per_request(self, device, B, H):
+        """Fixed multi-request batch folded into the head axis: [B*H, S, D]. Each
+        (request, head) slice must match running that request alone."""
+        dtype = torch.float16
+        S, D = 128, 64
+        torch.manual_seed(42)
+        q = torch.randn(S, B * H, D, device=device, dtype=dtype) * 0.1
+        k = torch.randn(S, B * H, D, device=device, dtype=dtype) * 0.1
+        v = torch.randn(S, B * H, D, device=device, dtype=dtype) * 0.1
+
+        o_batch = torch.zeros_like(q)
+        from kernels.prefill_attention.wrapper import context_attention_fwd_spyre
+        context_attention_fwd_spyre(q, k, v, o_batch)
+
+        # Reference: each request's H-head block run through the original alone.
+        for b in range(B):
+            sl = slice(b * H, (b + 1) * H)
+            qb, kb, vb = q[:, sl].contiguous(), k[:, sl].contiguous(), v[:, sl].contiguous()
+            ob = attn_ref(qb, kb, vb)
+            torch.testing.assert_close(o_batch[:, sl], ob, **TOL[dtype])
+
+    @pytest.mark.parametrize("short", [64, 96])
+    def test_variable_length_matches_original(self, device, short):
+        """Variable length: SEQ_MAX buffer, runtime seqlen bounds the attention.
+        The original kernel bounds attention with b_seq_len; the spyre kernel
+        uses a matching causal mask bounded to `short` plus the runtime seqlen
+        arg. Only the first `short` output rows are defined (queries past the
+        request length are not part of the request)."""
+        dtype = torch.float16
+        S_max, H, D = 128, 4, 64
+        q, k, v = _make(S_max, H, D, device, dtype)
+
+        # Reference: original with b_seq_len = [short] (causal, valid-length).
+        o_ref = torch.zeros_like(q)
+        b_start_loc = torch.zeros(1, device=device, dtype=torch.int32)
+        b_seq_len = torch.tensor([short], device=device, dtype=torch.int32)
+        context_attention_fwd(q, k, v, o_ref, b_start_loc, b_seq_len, S_max, is_causal=True)
+
+        # Spyre: causal mask bounded to `short` keys + runtime seqlen.
+        from kernels.prefill_attention.wrapper import build_additive_mask
+        mask = build_additive_mask(S_max, device, is_causal=True)
+        # Mask out keys >= short (the padded tail beyond this request's length).
+        col = torch.arange(S_max, device=device)[None, :]
+        mask = torch.where(col < short, mask, torch.full_like(mask, -1.0e9)).contiguous()
+
+        o_spyre = attn_spyre(q, k, v, mask=mask, seqlen=short)
+
+        # Compare only the valid query rows [0, short).
+        torch.testing.assert_close(o_spyre[:short], o_ref[:short], **TOL[dtype])

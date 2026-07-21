@@ -47,6 +47,7 @@ _SPYRE_SIGNATURE = {
     "num_kv_heads": "i32",
     "batch": "i32",
     "num_m_blocks": "i32",
+    "seqlen": "i32",
 }
 
 _SPYRE_CONSTEXPRS = {
@@ -81,6 +82,42 @@ def _dist_variant(grid: int) -> dict:
     }
 
 
+# ── Capability variants ─────────────────────────────────────────────────────
+# Each reclaims one original.py feature on the SAME spyre kernel — no kernel
+# change beyond the (degenerate-when-equal) head-dim padding split. Only the
+# CONSTEXPRS differ from the base; the SIGNATURE is shared.
+#
+#   spyre_gqa   — grouped-query attention: 4 query heads share 2 KV heads
+#                 (kv_group_num=2). The kernel already reads KV head
+#                 `cur_head // kv_group_num`; only num_kv_heads shrinks.
+#   spyre_pad   — head-dim padding: logical Lk=48 (not a stick multiple) padded
+#                 to one full stick BLOCK_DMODEL=64. Descriptor `shape` carries
+#                 BLOCK_DMODEL; the host pads+zeros lanes [48, 64) (reduction
+#                 axis). Only valid while BLOCK_DMODEL == one stick (== S).
+#
+# Fixed multi-request batch and sliding-window need NO distinct .ktir: the head
+# count (num_q_heads/num_kv_heads) is a runtime i32 arg, so the base `spyre.ktir`
+# already handles a B*HEADS-folded launch; and the window lives entirely in the
+# additive MASK tensor. Both are exercised by tests against the base KTIR.
+#
+# Variable length likewise needs NO distinct .ktir: `seqlen` is a runtime i32 arg
+# bounding the KV loop, so a `seqlen < SEQ` launch on the base `spyre.ktir` gives
+# the shorter-request result. `SEQ` stays the compile-time padded max.
+
+
+def _pad_constexprs() -> dict:
+    c = dict(_SPYRE_CONSTEXPRS)
+    c["Lk"] = 48          # logical head dim (not a stick multiple)
+    c["BLOCK_DMODEL"] = 64  # padded to one full stick (== S for fp16)
+    return c
+
+
+def _gqa_constexprs() -> dict:
+    c = dict(_SPYRE_CONSTEXPRS)
+    c["kv_group_num"] = 2  # 4 query heads / 2 KV heads
+    return c
+
+
 # NOTE: gen_ktir.py enumerates variants by statically parsing this dict's
 # *literal keys* (ast, no import), so every variant must appear as an explicit
 # key here — a loop that inserts keys afterward would be invisible to it.
@@ -90,6 +127,18 @@ VARIANTS = {
         "SIGNATURE": _SPYRE_SIGNATURE,
         "CONSTEXPRS": _SPYRE_CONSTEXPRS,
         # 32-core distribution grid, matching the wrapper's fixed NUM_CORES.
+        "GRID": [32],
+    },
+    "spyre_gqa": {
+        "KERNEL": _prefill_attention_kernel_spyre,
+        "SIGNATURE": _SPYRE_SIGNATURE,
+        "CONSTEXPRS": _gqa_constexprs(),
+        "GRID": [32],
+    },
+    "spyre_pad": {
+        "KERNEL": _prefill_attention_kernel_spyre,
+        "SIGNATURE": _SPYRE_SIGNATURE,
+        "CONSTEXPRS": _pad_constexprs(),
         "GRID": [32],
     },
     "spyre_dist_c1": _dist_variant(1),

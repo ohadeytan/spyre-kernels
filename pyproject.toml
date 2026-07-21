@@ -17,7 +17,7 @@ test = [
 ]
 
 [tool.uv.sources]
-ktir-cpu = { git = "https://github.com/torch-spyre/ktir-cpu", rev = "51e54f6fe407a35e8def2ff3443f436b16130949" }
+ktir-cpu = { git = "https://github.com/torch-spyre/ktir-cpu", rev = "78a05609ec" }
 
 [build-system]
 requires = ["hatchling"]

@@ -1,7 +1,7 @@
-// Generated from kernels/prefill_attention/spyre_dist_c32.py by scripts/gen_ktir.py
-// Source: kernels/prefill_attention/lower.py -> VARIANTS['spyre_dist_c32'].
+// Generated from kernels/prefill_attention/spyre_pad.py by scripts/gen_ktir.py
+// Source: kernels/prefill_attention/lower.py -> VARIANTS['spyre_pad'].
 // DO NOT EDIT BY HAND — regenerate with:
-//     .venv/bin/python scripts/gen_ktir.py prefill_attention:spyre_dist_c32
+//     .venv/bin/python scripts/gen_ktir.py prefill_attention:spyre_pad
 
 #map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 #map1 = affine_map<(d0, d1) -> (d0, d1)>

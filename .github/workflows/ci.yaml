@@ -25,7 +25,9 @@ env:
   # spyre-enabled Triton build used to lower kernels to KTIR. Pinned to the
   # sha the committed *.ktir were generated with (README pin); @main currently
   # breaks the make_tensor_descriptor lowering path (_unflatten_ir on None).
-  SPYRE_TRITON: "triton @ git+https://github.com/torch-spyre/triton@5b467467c883c53ec7a8a89f9e89cfd55241034b"
+  # fc434c5f (PR #52 "Add a scalar load") lowers runtime scalar tt.load +
+  # dynamic descriptor extents; the committed *.ktir here are drift-free under it.
+  SPYRE_TRITON: "triton @ git+https://github.com/torch-spyre/triton@fc434c5fe8e4223f035107f6723880d05476fc5a"
 
 jobs:
 # GPU tests - uncomment when we have a GPU worker available

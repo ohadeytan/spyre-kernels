@@ -29,6 +29,7 @@ def _prefill_attention_kernel_spyre(
     num_kv_heads,
     batch,
     num_m_blocks,
+    seqlen,
     kv_group_num: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -43,8 +44,13 @@ def _prefill_attention_kernel_spyre(
     - A ≤32-core distribution loop replaces the (batch, head, m_block) GPU grid;
       the work space is flattened and split over `tl.num_programs(0)` cores. The
       result is independent of the partition (distribution-invariant).
-    - head_dim (Lk) rides in the physical stick-tiled layout (Lk -> Lk//S, S)
-      directly in the descriptor shapes.
+    - head_dim rides in the physical stick-tiled layout (D -> D//S, S) directly
+      in the descriptor shapes. The descriptor carries the **physical (padded)**
+      head dim `BLOCK_DMODEL` (a whole number of sticks); the logical head dim
+      `Lk` may be smaller. When `Lk` is not a stick multiple, the host pads the
+      physical head dim to `BLOCK_DMODEL` and zero-fills lanes `[Lk, BLOCK_DMODEL)`
+      (on the reduction axis, so they must be real zeros). No-op when
+      `BLOCK_DMODEL == Lk`.
     - **Descriptors only, no `tl.arange`.** The Spyre KTIR backend lowers every
       pointer arg to a memory view (no `tt.addptr`) and does not lower
       `tt.make_range` (from `tl.arange`) to a ktdp/linalg form. So: (a) memory is
@@ -53,12 +59,14 @@ def _prefill_attention_kernel_spyre(
       `MASK[SEQ, SEQ]` tensor (0.0 allowed, -inf masked), loaded per tile through
       a descriptor and added to the scores — no in-kernel position vectors.
 
-    Single-request KTIR config (`batch == 1`): the seqlen is the static `SEQ`
-    constexpr, so no per-batch `B_Seqlen`/`B_Start_Loc` scalar loads are needed
-    (those would require an `tl.arange` one-hot to index, reintroducing
-    `tt.make_range`). The distribution loop and packed descriptors still carry
-    the general (batch, head, m_block) structure, so the GPU launch drives
-    multiple requests and any `num_cores`.
+    Variable length: `SEQ` is the compile-time **padded max** (descriptor and
+    mask extents); the runtime `seqlen` arg (<= SEQ) bounds the KV loop so each
+    launch attends only over its true length. Passing `seqlen == SEQ` is the
+    full-length case. seqlen is a plain i32 arg — NOT a `B_Seqlen`/`B_Start_Loc`
+    scalar load (which would emit a rank-0 memory view ktir-cpu can't execute
+    yet, or need an `tl.arange` one-hot → `tt.make_range`). The distribution loop
+    and packed descriptors still carry the general (batch, head, m_block)
+    structure, so the GPU launch drives any `num_cores`.
     """
     pid = tl.program_id(0)
     num_cores = tl.num_programs(0)
@@ -77,32 +85,39 @@ def _prefill_attention_kernel_spyre(
         cur_head = head_batch % num_q_heads
         cur_kv_head = cur_head // kv_group_num
 
-        # Physical stick layout: head_dim (Lk) is the stick-tiled innermost dim,
-        # factored (Lk -> Lk//S, S). The (Lk//S, S) stick pair is adjacent +
-        # innermost, so one reshape collapses each loaded tile to the logical
-        # [BLOCK_*, BLOCK_DMODEL] for tl.dot. Row-major strides over the physical
-        # shape [seq, heads, Lk//S, S] are [stride_*bs, stride_*h, S, 1].
+        # Physical stick layout: the head dim rides stick-tiled and innermost,
+        # factored (D -> D//S, S). The descriptor `shape` carries the **physical
+        # (padded) head dim** BLOCK_DMODEL, a whole number of sticks; the logical
+        # head dim `Lk` may be smaller (Lk <= BLOCK_DMODEL). When Lk is not a
+        # stick multiple the host pads the physical head dim to BLOCK_DMODEL and
+        # zero-fills lanes [Lk, BLOCK_DMODEL): those lanes sit on the QK/PV
+        # reduction axis, so they must be real zeros (they are NOT descriptor OOB
+        # fill). Degenerate (no padding) when BLOCK_DMODEL == Lk. The (D//S, S)
+        # stick pair is adjacent + innermost, so one reshape collapses each loaded
+        # tile to the logical [BLOCK_*, BLOCK_DMODEL] for tl.dot. Row-major strides
+        # over the physical shape [seq, heads, BLOCK_DMODEL//S, S] are
+        # [stride_*bs, stride_*h, S, 1].
         q_desc = tl.make_tensor_descriptor(
             Q,
-            shape=[SEQ, num_q_heads, Lk // S, S],
+            shape=[SEQ, num_q_heads, BLOCK_DMODEL // S, S],
             strides=[stride_qbs, stride_qh, S, 1],
             block_shape=[BLOCK_M, 1, BLOCK_DMODEL // S, S],
         )
         k_desc = tl.make_tensor_descriptor(
             K,
-            shape=[SEQ, num_kv_heads, Lk // S, S],
+            shape=[SEQ, num_kv_heads, BLOCK_DMODEL // S, S],
             strides=[stride_kbs, stride_kh, S, 1],
             block_shape=[BLOCK_N, 1, BLOCK_DMODEL // S, S],
         )
         v_desc = tl.make_tensor_descriptor(
             V,
-            shape=[SEQ, num_kv_heads, Lk // S, S],
+            shape=[SEQ, num_kv_heads, BLOCK_DMODEL // S, S],
             strides=[stride_vbs, stride_vh, S, 1],
             block_shape=[BLOCK_N, 1, BLOCK_DMODEL // S, S],
         )
         o_desc = tl.make_tensor_descriptor(
             Out,
-            shape=[SEQ, num_q_heads, Lk // S, S],
+            shape=[SEQ, num_q_heads, BLOCK_DMODEL // S, S],
             strides=[stride_obs, stride_oh, S, 1],
             block_shape=[BLOCK_M, 1, BLOCK_DMODEL // S, S],
         )
@@ -125,7 +140,13 @@ def _prefill_attention_kernel_spyre(
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
-        n_kv_blocks = tl.cdiv(SEQ, BLOCK_N)
+        # KV loop bound is the RUNTIME per-request seqlen (<= SEQ, the padded
+        # max). Only whole BLOCK_N tiles up to seqlen are visited; the host mask
+        # zeroes any keys within the last tile that overrun seqlen. When
+        # seqlen == SEQ this is the full-length case (byte-identical to a static
+        # SEQ bound). seqlen rides as an i32 arg, not a B_Seqlen scalar load, so
+        # no rank-0 memory view is emitted (ktir-cpu-executable today).
+        n_kv_blocks = tl.cdiv(seqlen, BLOCK_N)
         for kv_start in range(0, n_kv_blocks * BLOCK_N, BLOCK_N):
             # Descriptors require the last dim contiguous, so K is loaded as
             # (BLOCK_N, BLOCK_DMODEL) and transposed before the dot.

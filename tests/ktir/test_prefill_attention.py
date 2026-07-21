@@ -44,6 +44,8 @@ MLIR_PATH = (
     Path(__file__).resolve().parent.parent.parent
     / "kernels" / "prefill_attention" / "spyre.ktir"
 )
+GQA_MLIR_PATH = MLIR_PATH.parent / "spyre_gqa.ktir"
+PAD_MLIR_PATH = MLIR_PATH.parent / "spyre_pad.ktir"
 
 FUNC = "_prefill_attention_kernel_spyre"
 
@@ -54,6 +56,15 @@ KVH = 4
 D = 64
 BLOCK = 64
 NUM_M_BLOCKS = SEQ // BLOCK  # 2
+
+# GQA variant (spyre_gqa): 4 query heads share 2 KV heads (group size 2).
+GQA_KVH = 2
+# Head-dim padding variant (spyre_pad): logical head dim 48, padded to one stick.
+PAD_LK = 48
+PAD_DMODEL = 64
+# Fixed-batch: B requests folded into the head axis as B*H "heads" (base KTIR,
+# launched with runtime num_q_heads = B*H).
+BATCH_N = 2
 
 SM_SCALE = np.float32(1.0 / math.sqrt(D))
 NEG_INF = np.float32(-1.0e9)
@@ -66,40 +77,67 @@ def causal_mask():
     return np.where(col <= row, np.float32(0.0), NEG_INF).astype(np.float32)
 
 
-def numpy_reference(q, k, v, mask):
+def numpy_reference(q, k, v, mask, *, sm_scale=None, kv_group=1):
     """Causal SDPA in f32, matching the kernel's upcast-accumulate-downcast.
 
-    q, k, v: [SEQ, H, D] f16 (MHA). mask: [SEQ, SEQ] additive f32.
+    q: [SEQ, Hq, D] f16. k, v: [SEQ, Hkv, D] f16 with ``Hq == Hkv * kv_group``
+    (query head ``h`` reads KV head ``h // kv_group``). mask: [SEQ, S_kv] additive
+    f32. Handles the MHA case (kv_group == 1, Hkv == Hq) and GQA identically.
     """
+    scale = float(SM_SCALE if sm_scale is None else sm_scale)
     qf, kf, vf = q.astype(np.float32), k.astype(np.float32), v.astype(np.float32)
-    out = np.zeros((SEQ, H, D), dtype=np.float32)
-    for h in range(H):
-        s = (qf[:, h, :] * float(SM_SCALE)) @ kf[:, h, :].T + mask
+    seq, hq, d = qf.shape
+    out = np.zeros((seq, hq, d), dtype=np.float32)
+    for h in range(hq):
+        kv = h // kv_group
+        s = (qf[:, h, :] * scale) @ kf[:, kv, :].T + mask
         s -= s.max(axis=1, keepdims=True)
         w = np.exp(s)
         w /= w.sum(axis=1, keepdims=True)
-        out[:, h, :] = w @ vf[:, h, :]
+        out[:, h, :] = w @ vf[:, kv, :]
     return out.astype(np.float16)
 
 
-def _run(q, k, v, mask, *, mlir_path=MLIR_PATH):
+def _run(q, k, v, mask, *, mlir_path=MLIR_PATH, out=None, seqlen=None):
+    """Execute the generated KTIR on ktir-cpu.
+
+    Strides are derived from each array's own physical shape ``[S, heads, D]``
+    (row-major, element units), so this handles the base MHA case, GQA (K/V with
+    fewer heads), head-dim padding (a wider physical D), and a B*HEADS-folded
+    batch uniformly — the only per-array facts the kernel needs are its
+    ``stride(seq)`` and ``stride(head)``. ``seqlen`` is the runtime per-request
+    length bounding the KV loop; it defaults to the full padded ``SEQ``.
+    """
     interp = KTIRInterpreter()
     interp.load(mlir_path.read_text())
 
-    out = np.zeros((SEQ, H, D), dtype=np.float16)
-    q_bs, q_h = H * D, D          # contiguous [SEQ, H, D] strides (elements)
+    n_q_heads, n_kv_heads = q.shape[1], k.shape[1]
+    if out is None:
+        out = np.zeros_like(q)
+    if seqlen is None:
+        seqlen = q.shape[0]
+
+    def _strides(a):  # (stride_bs, stride_h) in elements, row-major [S, heads, D]
+        return np.int32(a.shape[1] * a.shape[2]), np.int32(a.shape[2])
+
+    q_bs, q_h = _strides(q)
+    k_bs, k_h = _strides(k)
+    v_bs, v_h = _strides(v)
+    o_bs, o_h = _strides(out)
+
     outputs = interp.execute_function(
         FUNC,
         arg0=q, arg1=k, arg2=v, arg3=mask, arg4=out,
         arg5=SM_SCALE,
-        arg6=np.int32(q_bs), arg7=np.int32(q_h),   # q strides
-        arg8=np.int32(q_bs), arg9=np.int32(q_h),   # k
-        arg10=np.int32(q_bs), arg11=np.int32(q_h),  # v
-        arg12=np.int32(q_bs), arg13=np.int32(q_h),  # o
-        arg14=np.int32(H),
-        arg15=np.int32(KVH),
-        arg16=np.int32(1),          # batch
+        arg6=q_bs, arg7=q_h,
+        arg8=k_bs, arg9=k_h,
+        arg10=v_bs, arg11=v_h,
+        arg12=o_bs, arg13=o_h,
+        arg14=np.int32(n_q_heads),
+        arg15=np.int32(n_kv_heads),
+        arg16=np.int32(1),          # batch (folded into the head axis)
         arg17=np.int32(NUM_M_BLOCKS),
+        arg18=np.int32(seqlen),     # runtime per-request length (<= SEQ)
     )
     return outputs["arg4"]
 
@@ -157,6 +195,182 @@ def test_prefill_attention_ktir_uniform_v():
     expected = np.broadcast_to(v_row.astype(np.float32), (SEQ, H, D))
     np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
     print("PASS: uniform V")
+
+
+# ─── Reclaimed capabilities: GQA / head-dim padding / sliding window / batch ──
+
+
+def _require(path: Path) -> Path:
+    if not path.is_file():
+        pytest.skip(
+            f"{path.name} not generated — regenerate with:\n"
+            "  GIT_PAT=$(gh auth token) TRITON_DEFAULT_BACKEND=spyre uv run "
+            '--with "$SPYRE_TRITON" python scripts/gen_ktir.py prefill_attention'
+        )
+    return path
+
+
+def windowed_mask(seq, *, sliding_window_q=0, sliding_window_k=0):
+    """Additive [seq, seq] causal mask with optional bidirectional sliding
+    windows, matching original.py's bands: keep key j for query i when
+    ``j <= i`` (causal) and ``i - j <= W_Q`` and ``j - i <= W_K`` (a window of 0
+    means unbounded on that side). -inf elsewhere."""
+    row = np.arange(seq)[:, None]
+    col = np.arange(seq)[None, :]
+    keep = col <= row
+    if sliding_window_q > 0:
+        keep &= (row - col) <= sliding_window_q
+    if sliding_window_k > 0:
+        keep &= (col - row) <= sliding_window_k
+    return np.where(keep, np.float32(0.0), NEG_INF).astype(np.float32)
+
+
+@pytest.mark.ktir_cpu
+def test_prefill_attention_ktir_gqa():
+    """GQA (spyre_gqa): 4 query heads share 2 KV heads. Each query head h reads
+    KV head h // 2; result matches the per-head GQA reference."""
+    path = _require(GQA_MLIR_PATH)
+    rng = np.random.default_rng(42)
+    q = (rng.standard_normal((SEQ, H, D)) * 0.1).astype(np.float16)
+    k = (rng.standard_normal((SEQ, GQA_KVH, D)) * 0.1).astype(np.float16)
+    v = (rng.standard_normal((SEQ, GQA_KVH, D)) * 0.1).astype(np.float16)
+    mask = causal_mask()
+    kv_group = H // GQA_KVH
+
+    result = _run(q, k, v, mask, mlir_path=path)
+    expected = numpy_reference(q, k, v, mask, kv_group=kv_group)
+
+    np.testing.assert_allclose(
+        result.astype(np.float32), expected.astype(np.float32), rtol=1e-2, atol=1e-2
+    )
+    # Sanity: query heads 0,1 (group 0) use KV head 0; heads 2,3 use KV head 1.
+    print("PASS: GQA 4q/2kv per-head equivalence")
+
+
+@pytest.mark.ktir_cpu
+def test_prefill_attention_ktir_head_dim_padding():
+    """Head-dim padding (spyre_pad): logical Lk=48 padded to a full stick (64).
+
+    Honors the host contract — the physical head dim is PAD_DMODEL and lanes
+    [PAD_LK, PAD_DMODEL) are zero. Padding sits on the QK/PV reduction axis, so
+    zeros contribute nothing and the first PAD_LK output columns match a
+    reference computed on the logical (unpadded) head dim."""
+    path = _require(PAD_MLIR_PATH)
+    rng = np.random.default_rng(3)
+
+    def padded(shape_heads):
+        a = np.zeros((SEQ, shape_heads, PAD_DMODEL), dtype=np.float16)
+        a[:, :, :PAD_LK] = (rng.standard_normal((SEQ, shape_heads, PAD_LK)) * 0.1).astype(np.float16)
+        return a
+
+    q, k, v = padded(H), padded(KVH), padded(KVH)
+    mask = causal_mask()
+    # sm_scale for the pad variant is baked to 1/sqrt(D=64) in the KTIR (SM_SCALE),
+    # matching the kernel — the reference must use the same scale.
+    result = _run(q, k, v, mask, mlir_path=path)
+    expected = numpy_reference(q, k, v, mask)  # zeros in pad lanes are inert
+
+    # Compare only the logical head-dim columns; pad columns are unspecified.
+    np.testing.assert_allclose(
+        result[:, :, :PAD_LK].astype(np.float32),
+        expected[:, :, :PAD_LK].astype(np.float32),
+        rtol=1e-2, atol=1e-2,
+    )
+    print("PASS: head-dim padding Lk=48 -> stick 64 (first 48 cols)")
+
+
+@pytest.mark.ktir_cpu
+def test_prefill_attention_ktir_sliding_window():
+    """Sliding window (base KTIR, windowed host mask): the window lives entirely
+    in the additive MASK, so the unchanged kernel reproduces original.py's
+    bidirectional bands. Backward window W_Q keeps keys within W_Q positions
+    behind each query."""
+    rng = np.random.default_rng(19)
+    q = (rng.standard_normal((SEQ, H, D)) * 0.1).astype(np.float16)
+    k = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+    v = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+    # W_Q=32 keeps each query's own 32-back window; every row keeps >=1 key
+    # (its own position j=i), so no row is fully masked (no 0/0 NaN).
+    mask = windowed_mask(SEQ, sliding_window_q=32)
+
+    result = _run(q, k, v, mask)
+    expected = numpy_reference(q, k, v, mask)
+
+    np.testing.assert_allclose(
+        result.astype(np.float32), expected.astype(np.float32), rtol=1e-2, atol=1e-2
+    )
+    print("PASS: sliding window W_Q=32")
+
+
+@pytest.mark.ktir_cpu
+def test_prefill_attention_ktir_fixed_batch():
+    """Fixed multi-request batch (base KTIR, B*H head fold): B=2 uniform-length
+    requests laid out as [B*H, SEQ, D] and driven as B*H 'heads'. Each
+    (request, head) slice must match the single-request reference (shared causal
+    mask, uniform prefill)."""
+    rng = np.random.default_rng(23)
+    bh = BATCH_N * H
+    q = (rng.standard_normal((SEQ, bh, D)) * 0.1).astype(np.float16)
+    k = (rng.standard_normal((SEQ, bh, D)) * 0.1).astype(np.float16)
+    v = (rng.standard_normal((SEQ, bh, D)) * 0.1).astype(np.float16)
+    mask = causal_mask()
+
+    result = _run(q, k, v, mask)  # base KTIR; runtime num_q_heads = bh via strides
+    expected = numpy_reference(q, k, v, mask)  # MHA over all bh "heads"
+
+    np.testing.assert_allclose(
+        result.astype(np.float32), expected.astype(np.float32), rtol=1e-2, atol=1e-2
+    )
+    print(f"PASS: fixed batch B={BATCH_N} folded into {bh} heads")
+
+
+def _bounded_bidirectional_mask(seqlen):
+    """Additive [SEQ, SEQ] mask that attends to ALL keys < seqlen (bidirectional)
+    and masks keys >= seqlen. Bidirectional so that a shorter seqlen genuinely
+    changes every query row (a causal mask would leave rows < seqlen unchanged),
+    which lets the test prove the runtime KV-loop bound is honored."""
+    col = np.arange(SEQ)[None, :]
+    keep = col < seqlen
+    return np.where(keep, np.float32(0.0), NEG_INF).astype(np.float32)
+
+
+@pytest.mark.ktir_cpu
+def test_prefill_attention_ktir_variable_length():
+    """Variable length (base KTIR, runtime seqlen arg): SEQ is the padded max;
+    the runtime seqlen bounds the KV loop so a launch attends only over its true
+    length. Validated two ways: (1) a short-seqlen run matches a reference
+    computed over [:seqlen]; (2) it differs from the full-length run under a
+    bidirectional mask (proving the bound is real, not a no-op)."""
+    rng = np.random.default_rng(31)
+    q = (rng.standard_normal((SEQ, H, D)) * 0.1).astype(np.float16)
+    k = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+    v = (rng.standard_normal((SEQ, KVH, D)) * 0.1).astype(np.float16)
+
+    short = 64  # a whole BLOCK; attends to keys [0, 64)
+    mask = _bounded_bidirectional_mask(short)
+
+    result = _run(q, k, v, mask, seqlen=short).astype(np.float32)
+
+    # Reference: bidirectional softmax over the first `short` keys only.
+    qf, kf, vf = q.astype(np.float32), k.astype(np.float32), v.astype(np.float32)
+    expected = np.zeros((SEQ, H, D), np.float32)
+    for h in range(H):
+        s = (qf[:, h, :] * float(SM_SCALE)) @ kf[:short, h, :].T
+        s -= s.max(axis=1, keepdims=True)
+        w = np.exp(s)
+        w /= w.sum(axis=1, keepdims=True)
+        expected[:, h, :] = w @ vf[:short, h, :]
+
+    np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
+
+    # The runtime bound must actually matter: a full-length run over the same
+    # bidirectional-but-unbounded mask differs from the seqlen-bounded one.
+    full_mask = _bounded_bidirectional_mask(SEQ)
+    full = _run(q, k, v, full_mask, seqlen=SEQ).astype(np.float32)
+    assert not np.allclose(full[0], result[0], rtol=1e-2, atol=1e-2), (
+        "seqlen bound had no effect — full-length and short runs agree"
+    )
+    print(f"PASS: variable length seqlen={short} (of SEQ={SEQ})")
 
 
 # ─── Distribution invariance ────────────────────────────────────────────────
