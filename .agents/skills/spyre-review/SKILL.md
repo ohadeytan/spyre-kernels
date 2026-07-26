@@ -72,10 +72,21 @@ For stick-tiled tensors, verify the `tl.spyre_tensor_layout` markers (see
   a hard-coded `64` on a non-2-byte dtype is a FAIL.
 - **Axis matches intent**: the marked axis is the one actually stick-tiled; A
   stick-on-K vs stick-on-M changes the synthesized case.
+- **Operands only** are marked. Logical intermediates, elementwise addends (a
+  bias / additive mask), and any operand transposed into `tl.dot` must be
+  **unmarked** — a marked operand reaching `tl.dot` through a `tt.trans`, or a
+  marked non-operand, is a FAIL. Verify the transposed matmul operand (e.g. `K^T`)
+  is an *unmarked* load carried in via `tl.trans`.
+- **Batched matmul**: for an N-D descriptor whose leading axis is a batch/head
+  dim, that axis is an **identity dim** (a bare `src` int), and only the inner
+  matmul axis is stick-tiled — a stick entry on the batch axis is a FAIL.
+- **Dynamic extent**: a runtime-sized axis appears in `shape` only; `strides` and
+  `block_shape` for that descriptor stay compile-time constant — a runtime value
+  in `block_shape`/`strides` is a FAIL.
 - **Output descriptor** carries a marker when the store must scatter into sticks.
-- Because PR #19's `RewriteDescriptorLayout` closes the layout gap, a *missing*
-  marker where one is needed is a **FAIL**, not a `# [gap]` (reconcile with
-  Step 3 / `gap-handling.md`).
+- Because `RewriteDescriptorLayout` closes the layout gap, a *missing* marker
+  where one is needed is a **FAIL**, not a `# [gap]` (reconcile with Step 3 /
+  `gap-handling.md`).
 
 ### Step 3 — Spyre-compiler descriptor patterns
 

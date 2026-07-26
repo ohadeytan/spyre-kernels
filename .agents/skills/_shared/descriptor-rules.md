@@ -150,7 +150,7 @@ element.)
 
 ## 6. Physical stick layout — annotate with `tl.spyre_tensor_layout` (Proposal 2)
 
-> **Spyre-family only, PR-#19-gated.** For stick-tiled tensors, keep the
+> **Spyre-family only.** For stick-tiled tensors, keep the
 > descriptor **logical** and declare the physical layout with a
 > `tl.spyre_tensor_layout` marker; the compiler synthesizes the physical loops.
 > `tl.dot` is unchanged and there is no reshape glue.
@@ -160,6 +160,8 @@ tl.spyre_tensor_layout(a_desc, [(0, "floordiv", 64), 1, (0, "mod", 64)])  # A[M,
 ```
 
 The stick divisor is `S = 128 // dtype_bytes` (64 fp16/bf16, 32 fp32, 128 fp8),
-and the list must be **inline** (or a `constexpr` arg). Full coordinate-map
-reference, cases, output-sink behavior, and the dependency pin:
+and the list must be **inline** (or a `constexpr` arg). Mark only operands that
+flow into `tl.dot`; a leading batch/head axis is an identity dim (bare int) and
+batches the matmul. Full coordinate-map reference, batched matmul, mark-vs-unmark
+rules, dynamic extent, output-sink behavior, and the dependency pin:
 [`spyre/tensor-layout-marker.md`](spyre/tensor-layout-marker.md).
