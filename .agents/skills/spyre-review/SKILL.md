@@ -59,6 +59,35 @@ original's `other=`). Per `descriptor-rules.md` §4 a scalar descriptor must be
 resolved (last dim ≥ 16 bytes) or the kernel declared non-portable — a surviving
 scalar descriptor or stale gap annotation is a FAIL.
 
+### Step 2b — Physical layout markers (Proposal 2)
+
+For stick-tiled tensors, verify the `tl.spyre_tensor_layout` markers (see
+[`../_shared/spyre/tensor-layout-marker.md`](../_shared/spyre/tensor-layout-marker.md)):
+- **Present** on each stick-tiled descriptor; **inline literal** or a `constexpr`
+  arg (a list bound to a plain local is a compile error — FAIL).
+- **Well-formed**: one entry per physical dim; `stick-on-X` form
+  `[(X,"floordiv",S), other, (X,"mod",S)]`; `src` indices in range for the
+  logical rank.
+- **Stick divisor** `S = 128 // dtype_bytes` (64 fp16/bf16, 32 fp32, 128 fp8) —
+  a hard-coded `64` on a non-2-byte dtype is a FAIL.
+- **Axis matches intent**: the marked axis is the one actually stick-tiled; A
+  stick-on-K vs stick-on-M changes the synthesized case.
+- **Operands only** are marked. Logical intermediates, elementwise addends (a
+  bias / additive mask), and any operand transposed into `tl.dot` must be
+  **unmarked** — a marked operand reaching `tl.dot` through a `tt.trans`, or a
+  marked non-operand, is a FAIL. Verify the transposed matmul operand (e.g. `K^T`)
+  is an *unmarked* load carried in via `tl.trans`.
+- **Batched matmul**: for an N-D descriptor whose leading axis is a batch/head
+  dim, that axis is an **identity dim** (a bare `src` int), and only the inner
+  matmul axis is stick-tiled — a stick entry on the batch axis is a FAIL.
+- **Dynamic extent**: a runtime-sized axis appears in `shape` only; `strides` and
+  `block_shape` for that descriptor stay compile-time constant — a runtime value
+  in `block_shape`/`strides` is a FAIL.
+- **Output descriptor** carries a marker when the store must scatter into sticks.
+- Because `RewriteDescriptorLayout` closes the layout gap, a *missing* marker
+  where one is needed is a **FAIL**, not a `# [gap]` (reconcile with Step 3 /
+  `gap-handling.md`).
+
 ### Step 3 — Spyre-compiler descriptor patterns
 
 The set of compiler descriptor gaps changes as the lowering evolves, so this

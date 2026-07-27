@@ -38,8 +38,9 @@ generation run with ``uv run --with``, which uses a separate ephemeral env and
 leaves the project ``.venv`` (stock PyPI Triton) untouched::
 
     # Regenerate every variant of every kernel with a lower.py driver:
+    # (Proposal 2: PR #19 fork carries the tl.spyre_tensor_layout builtin.)
     GIT_PAT=$(gh auth token) uv run \
-        --with "triton @ git+https://github.com/torch-spyre/triton@<sha>" \
+        --with "triton @ git+https://github.com/fabianlim/triton@<sha>" \
         python scripts/gen_ktir.py
 
     # ... one kernel / one variant / CI drift guard:

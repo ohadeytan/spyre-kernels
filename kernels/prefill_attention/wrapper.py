@@ -35,6 +35,10 @@ def context_attention_fwd(
     grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
     num_warps = 4 if Lk <= 64 else 8
 
+    # The tensor-descriptor kernel needs the head counts to build its 3D
+    # descriptor shapes (the original derived head indexing purely from
+    # strides). Supply them only when the target kernel declares them, and
+    # register the TMA allocator that make_tensor_descriptor requires.
     extra = {}
     if "num_q_heads" in kernel_fn.arg_names:
         ensure_triton_allocator()
